@@ -26,6 +26,8 @@ Uninstall: `docker extension rm docker-archive-ext:dev`
   paused), automatic archiving (idle X weeks, always removes from Docker), and the daily check
   (launchd) with a battery limit (always runs when plugged in).
 - History of every action (including failed and interrupted ones) and a live log.
+- Claude Code: install the skill that lets Claude Code restore an archived project when asked to
+  start it (`ensure`). Claude Code only; Claude.ai web/desktop chat skills can't reach Docker.
 
 The daily check runs the script copy inside the installed extension. Re-run
 "Install daily check" after updating the extension.

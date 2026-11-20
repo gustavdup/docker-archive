@@ -107,6 +107,9 @@
   .callout { display:flex; gap:8px; background:var(--warn-bg); color:var(--fg); border-radius:8px; padding:10px 12px; font-size:12px; line-height:1.5; }
   .callout svg { width:16px; height:16px; color:var(--warn); flex:none; margin-top:1px; }
   .hint { font-size:12px; color:var(--mut); margin:0; }
+  .code { font:12px/1.5 ui-monospace, Menlo, monospace; background:var(--bg); border:1px solid var(--line); border-radius:6px; padding:6px 8px; word-break:break-all; flex:1; min-width:0; }
+  .ccard { max-width:760px; }
+  .ccard ol { margin:0; padding-left:18px; line-height:1.6; }
   .savebar { display:flex; justify-content:flex-end; align-items:center; gap:10px; margin-top:12px; }
   @media (prefers-reduced-motion: reduce) { * { transition:none !important; animation:none !important; } }
 </style>
@@ -158,6 +161,7 @@
   <button class="tab" role="tab" aria-selected="false" data-tab="backups">Archives &amp; backups</button>
   <button class="tab" role="tab" aria-selected="false" data-tab="auto">Automation</button>
   <button class="tab" role="tab" aria-selected="false" data-tab="history">History</button>
+  <button class="tab" role="tab" aria-selected="false" data-tab="claude">Claude Code</button>
 </div>
 
 <section class="panel" id="p-projects" role="tabpanel">
@@ -224,6 +228,28 @@
 
 <section class="panel" id="p-history" role="tabpanel" hidden>
   <div class="tablewrap"><table id="htable"><thead><tr><th>Time</th><th>Action</th><th>Project</th><th>Result</th><th>Details</th></tr></thead><tbody></tbody></table></div>
+</section>
+
+<section class="panel" id="p-claude" role="tabpanel" hidden>
+  <div class="acard ccard">
+    <header><div><h2>Claude Code skill</h2><p class="hint">Lets Claude Code restore an archived project when you ask it to start one.</p></div>
+      <span id="skbadge" class="badge b-mut">Checking…</span></header>
+    <div class="body">
+      <ol class="small">
+        <li>Before starting a compose project, Claude runs <code>ensure .</code> in the project folder.</li>
+        <li>If the project was archived, it is restored and the copy stays on the drive. Otherwise nothing happens.</li>
+        <li>If the drive isn't connected, Claude asks you to connect it instead of starting the project with empty volumes.</li>
+      </ol>
+      <p class="hint">The skill only restores. It never backs up, archives, removes from Docker or deletes copies.</p>
+      <div class="srow"><span>Installs to</span><span class="ctl"><code id="skpath" class="small">…</code></span></div>
+      <p class="hint" id="skhint"></p>
+      <div class="row-act"><button id="skinst" onclick="skill(false)">Install</button><button id="skrem" class="ghost" onclick="skill(true)" style="display:none">Remove</button></div>
+      <div class="srow" style="align-items:flex-start"><span>Skip permission prompts<br><span class="hint">Optional. Add to <code>permissions.allow</code> in <code>~/.claude/settings.json</code>.</span></span></div>
+      <div class="row-act"><code id="skrule" class="code">…</code><button class="ghost" onclick="copyRule()">Copy</button></div>
+      <div class="callout"><svg><use href="#i-warn"/></svg><span>For <strong>Claude Code</strong> only: the CLI, the Code tab in the Claude desktop app, and IDE extensions.
+        Skills in Claude.ai on the web or in desktop chat can't reach Docker on your Mac, so they can't use this.</span></div>
+    </div>
+  </div>
 </section>
 
 <details class="logbox" id="logbox"><summary>Activity log <span id="busy" class="mut small"></span></summary><div id="log" aria-live="polite"></div></details>
@@ -304,6 +330,7 @@ function setButtons() {
 
 async function refresh() {
   $("dest").value = dest;
+  try { renderSkill(JSON.parse(await call(["install-skill", "--status"]))); } catch (e) { $("skbadge").textContent = "Unknown"; }
   try { status = await json("status"); } catch (e) { log("status failed: " + e.message + "\n"); return; }
   $("drive").outerHTML = status.dest_mounted ? '<span id="drive" class="badge b-ok"><svg><use href="#i-dot"/></svg>Drive connected</span>'
                                               : '<span id="drive" class="badge b-bad"><svg><use href="#i-dot"/></svg>Drive not connected</span>';
@@ -445,7 +472,8 @@ function openDrawer(tr, key, fill) {
 }
 
 const HACT = { backup: "Back up", archive: "Archive", remove: "Remove from Docker", restore: "Restore", "delete-backup": "Delete",
-               verify: "Verify", auto: "Daily check", settings: "Settings changed", schedule: "Daily check setup" };
+               verify: "Verify", auto: "Daily check", settings: "Settings changed", schedule: "Daily check setup",
+               skill: "Claude Code skill", "add-images": "Add images to archive", "remove-images": "Remove images" };
 function renderHistory(list) {
   const tb = $("htable").tBodies[0]; tb.innerHTML = "";
   for (const h of list.slice(-300).reverse()) {
@@ -464,6 +492,9 @@ function renderHistory(list) {
     if (h.kept_backup) det.push("archive kept");
     if (h.changes) det.push(h.changes);
     if (h.hour != null) det.push("daily at " + h.hour + ":00");
+    if (h.change) det.push(h.change);
+    if (typeof h.images === "string") det.push(h.images);
+    if (h.base_images) det.push("base images: " + h.base_images);
     tr.innerHTML = `<td class="mut when">${esc(new Date(h.time).toLocaleString(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }))}</td><td>${esc(HACT[h.action] || h.action)}</td>
       <td>${esc(h.project)}</td><td>${badge(cls, r.length > 60 ? r.slice(0, 60) + "…" : r)}</td><td class="mut small" title="${esc(r)}">${esc(det.join(" · "))}</td>`;
   }
@@ -526,13 +557,53 @@ async function saveAll() {
     settingsChanged(false); refresh();
   } catch (e) { dd.desktopUI.toast.error(e.message); }
 }
+const SKILL = {
+  "installed":     ["b-ok",   "Installed",        "Up to date. Claude Code picks it up in new sessions."],
+  "outdated":      ["b-warn", "Update available", "The installed copy differs from this version or uses another archive folder. Update it."],
+  "not-installed": ["b-mut",  "Not installed",    "Install it, then start a new Claude Code session."],
+  "no-claude":     ["b-mut",  "Claude Code not found", "No ~/.claude folder on this Mac. Install Claude Code first."],
+  "foreign":       ["b-bad",  "Folder in use",    "A different skill already uses this folder. It is left alone."] };
+let skState = null;
+function renderSkill(st) {
+  skState = st.state;
+  const [cls, label, hint] = SKILL[st.state] || ["b-mut", st.state, ""];
+  $("skbadge").className = "badge " + cls;
+  $("skbadge").innerHTML = (st.state === "installed" ? '<svg><use href="#i-dot"/></svg>' : "") + esc(label);
+  $("skhint").textContent = hint; $("skpath").textContent = st.path; $("skrule").textContent = st.permission_rule;
+  $("skinst").textContent = st.state === "outdated" ? "Update" : "Install";
+  $("skinst").style.display = st.state === "installed" ? "none" : "";
+  $("skinst").disabled = st.state === "no-claude" || st.state === "foreign";
+  $("skrem").style.display = (st.state === "installed" || st.state === "outdated") ? "" : "none";
+}
+async function skill(remove) {
+  $("skinst").disabled = $("skrem").disabled = true;
+  try {
+    await call(["install-skill", "--yes"].concat(remove ? ["--remove"] : []));
+    dd.desktopUI.toast.success(remove ? "Claude Code skill removed" : "Claude Code skill installed · start a new Claude Code session");
+  } catch (e) { dd.desktopUI.toast.error(e.message); }
+  $("skrem").disabled = false;
+  refresh();
+}
+async function copyRule() {
+  const t = $("skrule").textContent;
+  try { await navigator.clipboard.writeText(t); dd.desktopUI.toast.success("Copied"); }
+  catch (e) { const r = document.createRange(); r.selectNodeContents($("skrule")); const s = getSelection(); s.removeAllRanges(); s.addRange(r);
+              dd.desktopUI.toast.warning("Selected. Press ⌘C to copy."); }
+}
 function runAuto() { stream(["auto"]); }
 function schedule(on) { stream(on ? ["schedule", "--hour", String($("ahour").value)] : ["schedule", "--remove"]); }
 async function pickDest() {
   const r = await dd.desktopUI.dialog.showOpenDialog({ properties: ["openDirectory", "createDirectory"] });
   if (!r.canceled && r.filePaths.length) { $("dest").value = r.filePaths[0]; saveDest(); }
 }
-function saveDest() { dest = $("dest").value.trim() || DEFAULT_DEST; try { localStorage.setItem("dest", dest); } catch (e) {} refresh(); }
+async function saveDest() {
+  dest = $("dest").value.trim() || DEFAULT_DEST; try { localStorage.setItem("dest", dest); } catch (e) {}
+  if (skState === "installed" || skState === "outdated") {   // the skill has the archive folder built in
+    try { await call(["install-skill", "--yes"]); dd.desktopUI.toast.success("Claude Code skill now uses the new folder"); }
+    catch (e) { dd.desktopUI.toast.error("Claude Code skill not updated: " + e.message); }
+  }
+  refresh();
+}
 
 refresh();
 </script>

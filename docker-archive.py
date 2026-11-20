@@ -14,6 +14,9 @@ Commands (all are dry runs unless --yes is given):
   remove   ARCHIVE_DIR                 delete the archived project from Docker
   restore  ARCHIVE_DIR [--start]       bring the project back into Docker
   archives                             list archives on the drive
+  ensure   PROJECT|PATH [--start]      make sure a project is in Docker: restore the
+                                       newest copy if it is not (for scripts and agents)
+  install-skill [--remove|--status]    install the Claude Code skill that uses ensure
 
 Safety rules:
   - The destination must be on a mounted external drive (not the Mac's own
@@ -463,6 +466,24 @@ def is_short_id(ref):
     return bool(re.match(r"^(sha256:)?[0-9a-f]{12,64}$", ref or ""))
 
 
+def base_images_for(tags):
+    """Tagged images the given images were built on (FROM ...): their layers are the start of a project image's
+    layers. No container runs them, but the project's images need them to be rebuilt. Shared layers make this free
+    in images.tar."""
+    proj = {}
+    for t in tags:
+        info = docker_json(["image", "inspect", t])[0]
+        proj[info["Id"]] = info.get("RootFS", {}).get("Layers") or []
+    ids = sorted(set(run(["docker", "images", "-q", "--no-trunc"]).split()) - set(proj))
+    out = []
+    for info in (docker_json(["image", "inspect"] + ids) if ids else []):
+        L = info.get("RootFS", {}).get("Layers") or []
+        tag = next((t for t in info.get("RepoTags") or [] if not t.startswith("docker-archive/")), None)
+        if tag and L and any(len(P) > len(L) and P[:len(L)] == L for P in proj.values()):
+            out.append(tag)
+    return sorted(out)
+
+
 def backup_project(s, dest_root, stamp):
     name = s["name"]
     adir = os.path.join(dest_root, safe_name(name), stamp)
@@ -577,13 +598,25 @@ def _backup_body(s, name, adir, tmp, helper, manifest, save_tags, tagged):
         manifest["compose"] = {"working_dir": wd, "config_files": files, "copied": copied}
 
     # ---- images (one save, shared layers stored once)
-    tags = sorted(set(save_tags))
+    bases = set(base_images_for([t for t in set(save_tags) if t != helper]))
+    if bases:
+        print("  including %d base image(s) the project's images are built on: %s" % (len(bases), ", ".join(sorted(bases))))
+    tags = sorted(set(save_tags) | bases)
     print("  saving %d image(s)..." % len(tags))
-    run(["docker", "save", "-o", os.path.join(tmp, "images.tar")] + tags, capture=False)
+    try:
+        run(["docker", "save", "-o", os.path.join(tmp, "images.tar")] + tags, capture=False)
+    except Abort:
+        if not bases:
+            raise
+        print("  WARNING: saving with the base images failed; saving the project's own images only")
+        bases = set()
+        tags = sorted(set(save_tags))
+        run(["docker", "save", "-o", os.path.join(tmp, "images.tar")] + tags, capture=False)
     for t in tags:
         iid = image_id(t)
         info = docker_json(["image", "inspect", t])[0]
-        manifest["images"].append({"tag": t, "id": iid, "all_tags": info.get("RepoTags") or []})
+        manifest["images"].append({"tag": t, "id": iid, "all_tags": info.get("RepoTags") or [],
+                                   "base": t in bases})
 
     # ---- volumes (fingerprint before and after: catches writes during the copy)
     for v in s["volumes"]:
@@ -757,7 +790,7 @@ def tar_image_names(path):
     return norm
 
 
-def verify_dir(d, quiet=False, need_complete=True):
+def verify_dir(d, quiet=False, need_complete=True, extras_strict=True):
     if need_complete and not os.path.isfile(os.path.join(d, "COMPLETE")):
         return False, "not a complete archive (no COMPLETE marker)"
     if not os.path.isfile(os.path.join(d, "manifest.json")):
@@ -778,10 +811,13 @@ def verify_dir(d, quiet=False, need_complete=True):
         return False, "checksum list is missing: " + ", ".join(sorted(missing))
     for rel, digest in listed.items():
         p = os.path.join(d, rel)
-        if not os.path.isfile(p):
-            return False, "missing " + rel
-        if sha256_file(p) != digest:
-            return False, "checksum mismatch " + rel
+        bad = "missing " + rel if not os.path.isfile(p) else \
+              "checksum mismatch " + rel if sha256_file(p) != digest else None
+        if bad and not extras_strict and (rel == EXTRA_LIST or rel.startswith("extra-images-")):
+            EXTRA_PROBLEM.append(bad)
+            print("  WARNING: %s. Restoring the project without the extra images." % bad)
+        elif bad:
+            return False, bad
     try:
         names = tar_image_names(os.path.join(d, "images.tar"))
     except (tarfile.TarError, OSError) as e:
@@ -789,6 +825,15 @@ def verify_dir(d, quiet=False, need_complete=True):
     unnamed = [i["tag"] for i in m["images"] if i["tag"] not in names]
     if unnamed:
         return False, "images.tar has no entry named: " + ", ".join(unnamed)
+    if os.path.exists(os.path.join(d, EXTRA_LIST)):
+        if EXTRA_LIST not in listed and extras_strict:
+            return False, "checksum list is missing: " + EXTRA_LIST
+        good, msg = verify_extra(d)
+        if not good and extras_strict:
+            return False, msg
+        if not good:
+            EXTRA_PROBLEM.append(msg)
+            print("  WARNING: extra images: %s. Restoring the project without them." % msg)
     for c in m["containers"]:
         if c.get("rootfs"):
             p = subprocess.run(["tar", "-tf", os.path.join(d, c["rootfs"])],
@@ -950,6 +995,8 @@ def cmd_remove(a):
     img_ids = sorted({c["image_id"] for c in m["containers"]})
     imgs_rm = [i for i in img_ids if i not in other_imgs and i not in helper_ids and image_id(i)]
     imgs_keep = [i for i in img_ids if i in other_imgs]
+    base_ids = [i["id"] for i in m["images"] if i.get("base") and i["id"] not in img_ids
+                and i["id"] not in other_imgs and i["id"] not in helper_ids and image_id(i["id"])]
     proj_nets = [n["Name"] for n in m.get("networks") or []
                  if (n.get("Labels") or {}).get("com.docker.compose.project") == m["project"]]
 
@@ -964,6 +1011,9 @@ def cmd_remove(a):
     print("  %d image(s) not used elsewhere" % len(imgs_rm))
     if imgs_keep:
         print("  keeping %d image(s) used by other containers" % len(imgs_keep))
+    if base_ids:
+        print("  base image(s), unless another image is still built on them: %s"
+              % ", ".join(next(i["tag"] for i in m["images"] if i["id"] == b) for b in base_ids))
     print("  network(s) if unused: %s" % (", ".join(proj_nets) or "-"))
     print("\nVolume deletion is permanent inside Docker. The only copy left will be the archive above.")
     confirm_plan(a.yes, "remove them")
@@ -982,6 +1032,16 @@ def cmd_remove(a):
             run(["docker", "rmi", "--no-prune", t], check=False)
         if image_id(i):
             run(["docker", "rmi", "--no-prune", i], check=False)
+    base_info = [docker_json(["image", "inspect", i])[0] for i in base_ids]
+    bases_removed = []
+    for info in sorted(base_info, key=lambda x: -len(x.get("RootFS", {}).get("Layers") or [])):
+        why = image_users(info["Id"], info.get("RootFS", {}).get("Layers") or [], set())
+        if why:
+            print("  keeping base image %s: %s" % ((info.get("RepoTags") or ["?"])[0], "; ".join(why)))
+            continue
+        for t in info.get("RepoTags") or []:
+            run(["docker", "rmi", "--no-prune", t], check=False)
+            bases_removed.append(t)
     still_used = {n for c in all_containers() for n in (c.get("NetworkSettings", {}).get("Networks") or {})}
     for n in proj_nets:
         if n not in still_used and ok(["docker", "network", "inspect", n]):
@@ -990,7 +1050,8 @@ def cmd_remove(a):
         f.write(now().isoformat() + "\n")
     os.remove(os.path.join(d, "REMOVING"))
     log_history(dest_root_of(d), "remove", m["project"], d,
-                containers=len(present), volumes=len(vols_rm), images=len(imgs_rm))
+                containers=len(present), volumes=len(vols_rm), images=len(imgs_rm),
+                base_images=", ".join(bases_removed) or None)
     print("Removed. Docker Desktop gives the space back to macOS gradually, so Docker.raw shrinks over time.")
     print("Restore with:  docker-archive.py restore \"%s\"" % d)
 
@@ -1171,8 +1232,10 @@ def rollback(created):
 
 
 def cmd_restore(a):
+    restore_lock(wait=False)
+    del EXTRA_PROBLEM[:]
     d = os.path.abspath(a.archive)
-    good, msg = verify_dir(d)
+    good, msg = verify_dir(d, extras_strict=False)
     if not good:
         die(msg)
     m = load_manifest(d)
@@ -1210,7 +1273,7 @@ def cmd_restore(a):
         log_history(root, "restore", m["project"], d, result="failed: %r" % e)
         die("unexpected error during restore: %r" % e)
     _print_paused(res["paused"])
-    finish_restore(a, d, m, root, res)
+    return finish_restore(a, d, m, root, res)
 
 
 def finish_restore(a, d, m, root, res):
@@ -1219,25 +1282,30 @@ def finish_restore(a, d, m, root, res):
         log_history(root, "restore", m["project"], d, started=False)
         print("\nBackup kept (containers were not started). Delete it later by restoring with --start,")
         print("or remove the folder yourself once you are happy.")
-        return
+        return "not started"
     if res["failed"]:
         log_history(root, "restore", m["project"], d, result="started with problems",
                     problems=[n for n, _ in res["failed"]])
         print("\nBackup KEPT because not every container started.")
-        return
+        return "problems"
     print("\nChecking the containers stay up (%ds)..." % a.check_seconds)
     bad = wait_healthy(res["started"], a.check_seconds)
     if bad:
         log_history(root, "restore", m["project"], d, result="unhealthy", problems=bad)
         print("Backup KEPT: %s" % "; ".join(bad))
-        return
+        return "unhealthy"
     print("All containers running and healthy.")
     if a.keep_backup:
         log_history(root, "restore", m["project"], d, kept_backup=True)
         print("Backup kept (--keep-backup).")
-        return
+        return "ok"
+    if EXTRA_PROBLEM:
+        log_history(root, "restore", m["project"], d, kept_backup=True, problems=EXTRA_PROBLEM)
+        print("Backup KEPT: the extra images (base images) did not come back: %s" % "; ".join(EXTRA_PROBLEM))
+        return "ok"
     size = delete_archive(d, "restored and running")
     log_history(root, "restore", m["project"], d, deleted_backup=True, size=size)
+    return "ok"
 
 
 def restore_steps(d, m, start, created, keep_restart=False):
@@ -1257,6 +1325,10 @@ def restore_steps(d, m, start, created, keep_restart=False):
         run(["docker", "load", "-i", os.path.join(d, "images.tar")], capture=False)
         for i in m["images"]:
             if image_id(i["tag"]) != i["id"]:
+                if i.get("base"):
+                    EXTRA_PROBLEM.append("base image %s did not load correctly" % i["tag"])
+                    print("  WARNING: base image %s did not load correctly; continuing without it" % i["tag"])
+                    continue
                 die("image %s did not load correctly" % i["tag"])
             for t in i.get("all_tags", []):
                 if t not in before and image_id(t) is None:
@@ -1265,6 +1337,7 @@ def restore_steps(d, m, start, created, keep_restart=False):
         for t, cur in before.items():
             run(["docker", "tag", cur, t], check=False)   # put the user's newer image back on its name
             run(["docker", "rmi", "--no-prune", keep[t]], check=False)
+    restore_extra_images(d)
     for c in m["containers"]:
         if c.get("retag") and image_id(c["retag"]) is None:
             run(["docker", "tag", c["image_override"], c["retag"]])
@@ -1398,7 +1471,7 @@ def dest_root_of(archive_dir):
     return os.path.dirname(os.path.dirname(os.path.abspath(archive_dir)))
 
 
-LOGGED_CMDS = {"backup", "remove", "restore", "delete-backup", "auto", "schedule", "settings"}
+LOGGED_CMDS = {"backup", "remove", "restore", "delete-backup", "auto", "schedule", "settings", "add-images"}
 RUN_LOG = []   # results logged during this run, so main() can add a record for failures
 
 
@@ -1874,6 +1947,652 @@ def cmd_archives(a):
             print("%-60s %9s  %s" % (d, human(size), " ".join(flags)))
 
 
+# ---------------------------------------------------------------- extra images (base images and others no container runs)
+
+EXTRA_LIST = "extra-images.json"
+EXTRA_PROBLEM = []   # set during a restore when extra images could not be checked or loaded: keep the archive
+
+
+def load_extra_list(d):
+    p = os.path.join(d, EXTRA_LIST)
+    if not os.path.isfile(p):
+        return []
+    with open(p) as f:
+        return json.load(f)
+
+
+def verify_extra(d):
+    """(ok, msg) for the extra image files listed in the archive, if any."""
+    try:
+        extra = load_extra_list(d)
+        if not isinstance(extra, list) or not all(isinstance(e, dict) and "file" in e and "tags" in e for e in extra):
+            raise ValueError("unexpected contents")
+    except (OSError, ValueError) as e:
+        return False, "%s unreadable: %s" % (EXTRA_LIST, e)
+    for e in extra:
+        try:
+            names = tar_image_names(os.path.join(d, e["file"]))
+        except (tarfile.TarError, OSError, TypeError) as err:
+            return False, "%s unreadable: %s" % (e["file"], err)
+        missing = [t for t in e["tags"] if t not in names]
+        if missing:
+            return False, "%s has no entry named: %s" % (e["file"], ", ".join(missing))
+    return True, "ok"
+
+
+def load_tar_keeping_names(path, tags):
+    """docker load, but leave any local image that already has one of these names on that name."""
+    before = {t: image_id(t) for t in tags if image_id(t)}
+    keep = {}
+    for n, (t, cur) in enumerate(sorted(before.items())):
+        keep[t] = "docker-archive/keep-extra:%d" % n
+        run(["docker", "tag", cur, keep[t]])
+    try:
+        run(["docker", "load", "-i", path], capture=False)
+    finally:
+        for t, cur in before.items():
+            run(["docker", "tag", cur, t], check=False)
+            run(["docker", "rmi", "--no-prune", keep[t]], check=False)
+    return before
+
+
+def restore_extra_images(d):
+    if EXTRA_PROBLEM:
+        return
+    try:
+        extra = load_extra_list(d)
+        if not isinstance(extra, list) or not all(isinstance(e, dict) and "file" in e and "tags" in e for e in extra):
+            raise ValueError("unexpected contents of " + EXTRA_LIST)
+    except (OSError, ValueError) as err:
+        EXTRA_PROBLEM.append(str(err))
+        return
+    for e in extra:
+        if all(image_id(t) for t in e["tags"]):
+            print("extra images already in Docker, not loaded: %s" % ", ".join(e["tags"]))
+            continue
+        print("loading extra images: %s..." % ", ".join(e["tags"]))
+        try:
+            kept = load_tar_keeping_names(os.path.join(d, e["file"]), e["tags"])
+        except Abort as err:
+            EXTRA_PROBLEM.append("%s did not load: %s" % (e["file"], err))
+            print("  WARNING: extra images did not load (%s). The project is restored without them." % err)
+            continue
+        for t in kept:
+            print("  %s already existed in Docker and was left as it is" % t)
+
+
+def image_users(img_id, layers, skip_ids):
+    """Why an image can't be removed: containers using it, or other images built on top of it."""
+    why = []
+    for c in all_containers():
+        if c.get("Image") == img_id:
+            why.append("container %s uses it" % c["Name"].lstrip("/"))
+    for line in run(["docker", "images", "-q", "--no-trunc"]).split():
+        if line == img_id or line in skip_ids:
+            continue
+        other = docker_json(["image", "inspect", line])[0]
+        ol = other.get("RootFS", {}).get("Layers") or []
+        if len(ol) > len(layers) and ol[:len(layers)] == layers:
+            why.append("image %s is built on it" % ((other.get("RepoTags") or [line[7:19]])[0]))
+    return why
+
+
+def _write_atomic(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def cmd_add_images(a):
+    """Add images no container runs (e.g. base images a project's images are built FROM) to an existing archive."""
+    d = os.path.abspath(a.archive)
+    good, msg = verify_dir(d, quiet=True)
+    if not good:
+        die(msg)
+    m = load_manifest(d)
+    root = dest_root_of(d)
+    have = {i["tag"] for i in m["images"]} | {t for e in load_extra_list(d) for t in e["tags"]}
+    imgs = []
+    for ref in a.images:
+        tag = ref if ":" in ref.split("/")[-1] else ref + ":latest"
+        if tag in have:
+            print("  %s is already in this archive, skipped" % tag)
+            continue
+        info = docker_json(["image", "inspect", tag])[0]
+        imgs.append({"tag": tag, "id": info["Id"], "size": info.get("Size", 0),
+                     "layers": info.get("RootFS", {}).get("Layers") or []})
+    if not imgs:
+        print("Nothing to add.")
+        return
+    print("Add to %s:" % d)
+    for i in imgs:
+        print("  %-45s %s" % (i["tag"], human(i["size"])))
+    blocked = {}
+    if a.remove:
+        ids = {i["id"] for i in imgs}
+        for i in imgs:
+            why = image_users(i["id"], i["layers"], ids)
+            if why:
+                blocked[i["tag"]] = why
+        print("Then remove them from Docker%s." % ("" if not blocked else ", except:"))
+        for t, why in blocked.items():
+            print("  keep %s: %s" % (t, "; ".join(why)))
+    confirm_plan(a.yes, "add them")
+    restore_lock(wait=False)
+
+    n = 1
+    while os.path.exists(os.path.join(d, "extra-images-%d.tar" % n)):
+        n += 1
+    fname = "extra-images-%d.tar" % n
+    final, tmp = os.path.join(d, fname), os.path.join(d, fname + ".partial")
+    snap = {}
+    for name in (EXTRA_LIST, "checksums.sha256"):
+        p = os.path.join(d, name)
+        snap[name] = open(p, "rb").read() if os.path.exists(p) else None
+    print("saving images (one copy of each shared layer)...")
+    try:
+        run(["docker", "save", "-o", tmp] + [i["tag"] for i in imgs])
+        names = tar_image_names(tmp)
+        bad = [i["tag"] for i in imgs if i["tag"] not in names]
+        if bad:
+            die("saved file has no entry for: %s" % ", ".join(bad))
+        fsync_path(tmp)
+        digest = sha256_file(tmp)
+        os.replace(tmp, final)
+        extra = load_extra_list(d) + [{"file": fname, "tags": [i["tag"] for i in imgs],
+                                       "ids": [i["id"] for i in imgs], "added": now().isoformat()}]
+        _write_atomic(os.path.join(d, EXTRA_LIST), (json.dumps(extra, indent=1) + "\n").encode())
+        lines = [l for l in snap["checksums.sha256"].decode().splitlines() if l.strip() and l[66:] != EXTRA_LIST]
+        lines += ["%s  %s" % (digest, fname), "%s  %s" % (sha256_file(os.path.join(d, EXTRA_LIST)), EXTRA_LIST)]
+        lines.sort(key=lambda l: l[66:])
+        _write_atomic(os.path.join(d, "checksums.sha256"), ("\n".join(lines) + "\n").encode())
+        fsync_path(d)
+        good, msg = verify_dir(d)
+        if not good:
+            die("the archive did not verify after adding the images: %s" % msg)
+    except BaseException:
+        # put the archive back exactly as it was
+        for name, data in snap.items():
+            p = os.path.join(d, name)
+            if data is None:
+                if os.path.exists(p):
+                    os.remove(p)
+            else:
+                _write_atomic(p, data)
+        for p in (tmp, final):
+            if os.path.exists(p):
+                os.remove(p)
+        fsync_path(d)
+        print("  the archive was put back as it was", file=sys.stderr)
+        raise
+    size = os.path.getsize(final)
+    log_history(root, "add-images", m["project"], d, images=", ".join(i["tag"] for i in imgs), size=size)
+    print("Added %d image(s), %s." % (len(imgs), human(size)))
+    if not a.remove:
+        return
+    removed = []
+    for i in sorted(imgs, key=lambda x: -len(x["layers"])):   # images built on others first
+        if i["tag"] in blocked:
+            continue
+        why = image_users(i["id"], i["layers"], {x["id"] for x in imgs if x["tag"] not in blocked})
+        if why:
+            print("  kept %s: %s" % (i["tag"], "; ".join(why)))
+            continue
+        if ok(["docker", "rmi", i["tag"]]):
+            removed.append(i["tag"])
+            print("  removed %s from Docker" % i["tag"])
+        else:
+            print("  could not remove %s" % i["tag"])
+    log_history(root, "remove-images", m["project"], d, images=", ".join(removed) or "-")
+
+
+
+# ---------------------------------------------------------------- ensure (for scripts and agents)
+
+# exit codes of `ensure` (the Claude Code skill documents them). 1 = other error, 2 = bad arguments.
+ENSURE_READY, ENSURE_NO_DRIVE, ENSURE_ASK = 0, 3, 4
+COMPOSE_FILES = ("compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml")
+INDEX_FILE = os.path.expanduser("~/.docker-archive-index.json")   # what is archived, for when the drive is away
+_RESTORE_LOCK = None
+
+
+def ensure_exit(code, msg):
+    print("ENSURE: %s" % msg)
+    sys.stdout.flush()
+    sys.exit(code)
+
+
+def restore_lock(wait):
+    """One restore at a time (UI and agents). Held until the process exits."""
+    global _RESTORE_LOCK
+    if _RESTORE_LOCK:
+        return
+    f = open("/tmp/docker-archive-restore.lock", "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        if not wait:
+            die("another restore is running. Wait for it to finish.")
+        print("Waiting for another restore to finish...")
+        sys.stdout.flush()
+        fcntl.flock(f, fcntl.LOCK_EX)
+    _RESTORE_LOCK = f
+
+
+def _real(p):
+    return os.path.realpath(host_path(p)) if p else ""
+
+
+def norm_project(s):
+    """docker compose's normalisation of a project name."""
+    return re.sub(r"[^a-z0-9_-]", "", s.lower()).lstrip("_-")
+
+
+def compose_dir_of(path):
+    """The folder docker compose would use from here: this one or the nearest parent with a compose file."""
+    p = path
+    while True:
+        if any(os.path.isfile(os.path.join(p, f)) for f in COMPOSE_FILES):
+            return p
+        up = os.path.dirname(p)
+        if up == p:
+            return None
+        p = up
+
+
+def compose_name(cdir):
+    """Project name compose uses for a folder: COMPOSE_PROJECT_NAME (env or .env), top-level name:, folder name."""
+    n = os.environ.get("COMPOSE_PROJECT_NAME")
+    if not n:
+        try:
+            with open(os.path.join(cdir, ".env")) as f:
+                for line in f:
+                    m = re.match(r"\s*(?:export\s+)?COMPOSE_PROJECT_NAME\s*=\s*['\"]?([^'\"\s#]+)", line)
+                    if m:
+                        n = m.group(1)
+        except OSError:
+            pass
+    if not n:
+        for fn in COMPOSE_FILES:
+            try:
+                with open(os.path.join(cdir, fn)) as f:
+                    m = re.search(r"(?m)^name:\s*['\"]?([^'\"\s#]+)", f.read())
+            except OSError:
+                continue
+            if m and "$" not in m.group(1):
+                n = m.group(1)
+            break
+    return norm_project(n or os.path.basename(cdir))
+
+
+def drive_copies(root):
+    """Every complete copy on the drive, plus the folders of copies that can't be read."""
+    good, bad = [], []
+    if not os.path.isdir(root):
+        return good, bad
+    for sub in sorted(os.listdir(root)):
+        pdir = os.path.join(root, sub)
+        if not os.path.isdir(pdir):
+            continue
+        for st in sorted(os.listdir(pdir)):
+            d = os.path.join(pdir, st)
+            if not (re.match(r"^\d{8}-\d{6}$", st) and os.path.isfile(os.path.join(d, "COMPLETE"))):
+                continue
+            try:
+                with open(os.path.join(d, "manifest.json")) as f:
+                    m = json.load(f)
+                proj = m["project"]
+                ok_ver = m.get("version", 1) >= 2
+            except (OSError, ValueError, KeyError, TypeError):
+                ok_ver, proj = False, None
+            if not ok_ver:
+                bad.append((sub, d))
+                continue
+            def mtime(*names):
+                ts = [os.path.getmtime(os.path.join(d, x)) for x in names if os.path.exists(os.path.join(d, x))]
+                return max(ts) if ts else None
+            good.append({"project": proj, "dir": d, "stamp": st, "m": m,
+                         "wd": _real((m.get("compose") or {}).get("working_dir")),
+                         "removed": mtime("REMOVED", "REMOVING"), "restored": mtime("RESTORED")})
+    # archived = removed from Docker from this copy, and the project has not come back since:
+    # no restore (from any copy of it) after the removal, and no newer copy (it was in Docker again for that)
+    for c in good:
+        group = [o for o in good if o["project"] == c["project"] and o["wd"] == c["wd"]]
+        c["archived"] = bool(c["removed"] and not c["restored"]
+                             and not any(o["restored"] and o["restored"] > c["removed"] for o in group)
+                             and not any(o["stamp"] > c["stamp"] for o in group))
+    return good, bad
+
+
+def archived_now(copies):
+    """{project: [folders]} of projects removed from Docker and not restored since."""
+    out = {}
+    for c in copies:
+        if c["archived"]:
+            out.setdefault(c["project"], [])
+            if c["wd"] not in out[c["project"]]:
+                out[c["project"]].append(c["wd"])
+    return out
+
+
+def load_index():
+    try:
+        with open(INDEX_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def sync_index(dest, copies=None):
+    """Remember what is archived on this drive, so ensure can answer while the drive is unplugged."""
+    if not (dest_available(dest) and os.path.isdir(dest)):
+        return
+    if copies is None:
+        copies, _ = drive_copies(dest)
+    idx = load_index()
+    idx[os.path.abspath(dest)] = {"synced": now().isoformat(), "archived": archived_now(copies)}
+    import tempfile
+    try:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(INDEX_FILE), prefix=".docker-archive-index.")
+        with os.fdopen(fd, "w") as f:
+            json.dump(idx, f)
+        os.replace(tmp, INDEX_FILE)
+    except OSError:
+        pass
+
+
+def missing_binds(m):
+    return sorted({b["source"] for c in m["containers"] for b in c["bind_mounts"] if not os.path.exists(b["source"])})
+
+
+def cmd_ensure(a):
+    """Make sure a project is in Docker before it is started. Restores it if it was archived. Never deletes."""
+    restore_lock(wait=True)
+    target = a.target
+    in_docker = {}   # project -> folders its containers came from
+    for c in all_containers():
+        in_docker.setdefault(project_of(c), set()).add(
+            _real((c["Config"].get("Labels") or {}).get("com.docker.compose.project.working_dir")))
+    drive = dest_available(a.dest) and os.path.isdir(a.dest)
+    copies, bad = drive_copies(a.dest) if drive else ([], [])
+    if drive:
+        sync_index(a.dest, copies)
+        arch = archived_now(copies)
+    else:
+        idx = load_index().get(os.path.abspath(a.dest))
+        arch = idx["archived"] if idx else None
+
+    if target in (".", "..") or "/" in target:
+        here = os.path.realpath(os.path.abspath(os.path.expanduser(target)))
+        if not os.path.isdir(here):
+            ensure_exit(ENSURE_ASK, "folder not found: %s" % here)
+        wd = compose_dir_of(here)
+        names = {compose_name(wd)} if wd else set()
+        if not wd:
+            wd = here
+            below = sorted({c["wd"] for c in copies if c["wd"].startswith(here + "/")}
+                           | {w for ws in (arch or {}).values() for w in ws if w.startswith(here + "/")})
+            if below:
+                ensure_exit(ENSURE_ASK, "there is no compose file in or above %s, but projects were saved from folders "
+                            "inside it: %s. Run ensure from the project's own folder." % (here, ", ".join(below)))
+        names |= {c["project"] for c in copies if c["wd"] == wd}
+        names |= {p for p, ws in (arch or {}).items() if wd in ws}
+        if not names:
+            ensure_exit(ENSURE_READY, "no compose project in %s. Nothing to restore." % here)
+    else:
+        wd = None
+        known = target in in_docker or target in (arch or {}) or any(c["project"] == target for c in copies)
+        names = {target if known else norm_project(target)} - {""}
+    others_idx = {d: e.get("archived", {}) for d, e in load_index().items() if d != os.path.abspath(a.dest)}
+
+    def elsewhere(n):
+        """Archived in a different archive folder than the one ensure was given (stale skill install)."""
+        for d, ar in others_idx.items():
+            if n in ar and (wd is None or wd in ar[n]):
+                ensure_exit(ENSURE_ASK, "%s is archived in another archive folder, %s, but ensure is using %s. Ask the "
+                            "user; the skill may need updating from the Claude Code tab in Docker Desktop." % (n, d, a.dest))
+
+    vols_now = set(run(["docker", "volume", "ls", "-q"]).split())
+    notes, todo = [], []
+    for n in sorted(names):
+        if n in in_docker:
+            if wd is None or wd in in_docker[n] or "" in in_docker[n]:
+                notes.append("%s is in Docker" % n)
+                continue
+            mine_arch = (arch is not None and wd in (arch or {}).get(n, [])) or \
+                any(c["project"] == n and c["wd"] == wd and c["archived"] for c in copies)
+            if mine_arch or arch is None:
+                ensure_exit(ENSURE_ASK, "a project named %s from another folder (%s) is in Docker, but the one in %s "
+                            "is %s. Starting it here would clash with the other one. Ask the user."
+                            % (n, ", ".join(sorted(in_docker[n])), wd,
+                               "archived" if mine_arch else "maybe archived (drive not connected)"))
+            notes.append("%s is in Docker (from %s)" % (n, ", ".join(sorted(in_docker[n]))))
+            continue
+        if not drive:
+            if arch is None:
+                ensure_exit(ENSURE_NO_DRIVE, "the archive drive is not connected (%s), and docker-archive has no record yet "
+                            "of what is archived on it. Connect the drive and run ensure again. Don't start %s before "
+                            "that." % (a.dest, n))
+            if n in arch:
+                ensure_exit(ENSURE_NO_DRIVE, "%s is archived on the drive, which is not connected (%s). Connect it and run "
+                            "ensure again. Don't start the project before that: it would get new, empty volumes."
+                            % (n, a.dest))
+            elsewhere(n)
+            notes.append("%s is not archived" % n)
+            continue
+        mine = [c for c in copies if c["project"] == n and (wd is None or c["wd"] == wd)]
+        if not mine:
+            others = sorted({c["wd"] or "?" for c in copies if c["project"] == n})
+            if others:
+                ensure_exit(ENSURE_ASK, "no copy of %s was saved from %s, but there are copies saved from %s. If the "
+                            "folder moved, ask the user, then run: ensure %s" % (n, wd, ", ".join(others), n))
+            if any(sub == safe_name(n) for sub, _ in bad):
+                ensure_exit(ENSURE_ASK, "the drive has copies of %s that can't be read or are from an old version." % n)
+            elsewhere(n)
+            notes.append("%s has no saved copy" % n)
+            continue
+        if wd is None and len({c["wd"] for c in mine}) > 1:
+            ensure_exit(ENSURE_ASK, "copies of %s were saved from several folders (%s). Run ensure from the project's "
+                        "folder instead." % (n, ", ".join(sorted({c["wd"] or "?" for c in mine}))))
+        archived = [c for c in mine if c["archived"]]
+        pick = max(archived or mine, key=lambda c: c["stamp"])
+        vols = [v["name"] for v in pick["m"]["volumes"]]
+        have = [v for v in vols if v in vols_now]
+        when = copy_time(pick["stamp"]).astimezone().strftime("%Y-%m-%d %H:%M")
+        if have and len(have) < len(vols):
+            ensure_exit(ENSURE_ASK, "%s has no containers and only some of its volumes (%s missing). Ask the user."
+                        % (n, ", ".join(v for v in vols if v not in have)))
+        if vols and have:
+            if archived:
+                ensure_exit(ENSURE_ASK, "%s was archived (removed from Docker) from the copy of %s, but its volumes exist "
+                            "again, probably created empty by a later start. Ask the user: the archived data is on the "
+                            "drive, and starting now would use the volumes in Docker." % (n, when))
+            notes.append("%s has no containers but its volumes are in Docker" % n)
+            continue
+        if archived or not vols:
+            if archived:
+                todo.append((n, pick))
+            else:
+                notes.append("%s has no volumes" % n)
+            continue
+        if not a.restore_anyway:
+            why = ("its newest copy (%s) was restored once already" % when) if pick["restored"] else \
+                  ("it was deleted from Docker outside docker-archive; there is a backup from %s" % when)
+            ensure_exit(ENSURE_ASK, "%s is not in Docker and its volumes are gone: %s. Ask the user whether to restore "
+                        "that copy (run ensure again with --restore-anyway) or start fresh." % (n, why))
+        todo.append((n, pick))
+
+    for n, c in todo:
+        holes = missing_binds(c["m"])
+        print("%s: restoring the copy %s" % (n, c["dir"]))
+        ra = argparse.Namespace(archive=c["dir"], start=a.start and not holes, keep_restart_policy=True,
+                                keep_backup=True, check_seconds=a.check_seconds, yes=True)
+        try:
+            outcome = cmd_restore(ra)
+        except Abort as e:
+            ensure_exit(ENSURE_ASK, "could not restore %s: %s" % (n, e))
+        finally:
+            sync_index(a.dest)
+        if holes:
+            ensure_exit(ENSURE_ASK, "restored %s (not started), but these bind-mount folders are missing: %s. Ask the "
+                        "user before starting it: Docker would create them empty." % (n, ", ".join(holes)))
+        if outcome in ("problems", "unhealthy"):
+            ensure_exit(ENSURE_ASK, "restored %s, but not every container started and stayed up (see above)." % n)
+        notes.append("restored %s%s" % (n, " and started it" if a.start else ""))
+    ensure_exit(ENSURE_READY, "%s. Start the project as usual." % "; ".join(notes))
+
+
+# ---------------------------------------------------------------- Claude Code skill
+
+SKILL_MARK = "<!-- installed by docker-archive install-skill -->"
+
+SKILL_TEMPLATE = """---
+name: docker-archive
+description: Restore a Docker Compose project that docker-archive moved to an external drive. Use before starting, running or spinning up a Docker Compose project on this Mac (docker compose up, "start the project", "run it locally"), and when a project's containers, volumes or images are missing from Docker.
+---
+
+# Restore archived Docker projects
+
+%(mark)s
+
+Some Docker Compose projects on this Mac are archived to an external drive by docker-archive to free disk space. An archived project has no containers, volumes or images in Docker until it is restored. Running `docker compose up` before restoring creates new, empty volumes: the project looks like its data is gone, and the archived data no longer fits in.
+
+## Before starting a compose project
+
+From the folder with the project's compose file, run:
+
+```bash
+%(ensure)s .
+```
+
+Or by compose project name: `%(ensure)s NAME`.
+
+- If nothing needs restoring, it returns at once.
+- If the project was archived, it restores it (containers created, not started) and keeps the copy on the drive.
+- A restore can take many minutes for big projects. Run the command in the background and wait for it to finish; don't stop it partway.
+
+Read the last line (it starts with `ENSURE:`) and the exit code:
+
+| Exit | Meaning | What to do |
+|---|---|---|
+| 0 | Ready: in Docker, restored, or nothing archived | Start the project the usual way, e.g. `docker compose up -d` |
+| 3 | The archive drive is not connected | Ask the user to connect it, then run ensure again. Don't start the project before that |
+| 4 | Needs a decision, or the restore failed | Stop. Show the user the `ENSURE:` line and do what they decide |
+| any other | Error (bad arguments, Docker not running, interrupted) | Stop and show the user the error |
+
+Add `--start` to let ensure start the restored containers and check they stay up.
+
+## Rules
+
+- Only restore. Never back up, archive, remove projects from Docker, or delete saved copies. Those change or delete data; the user does them in the Archive tab in Docker Desktop.
+- Use `--restore-anyway` only after the user says so (exit 4 explains when).
+- Don't create missing bind-mount folders or delete volumes to get past exit 4. Ask the user.
+"""
+
+WRAPPER_TEMPLATE = """#!/bin/sh
+# Generated by docker-archive install-skill. Runs only the ensure command (restore if missing).
+exec /usr/bin/python3 %(script)s --dest %(dest)s ensure "$@"
+"""
+
+
+def skill_paths():
+    base = os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")
+    d = os.path.join(base, "skills", "docker-archive")
+    return base, d
+
+
+def skill_files(a):
+    """What install-skill writes: {file name: (bytes, mode)}."""
+    import shlex
+    _, d = skill_paths()
+    with open(os.path.realpath(__file__), "rb") as f:
+        script = f.read()
+    ensure = os.path.join(d, "ensure")
+    wrapper = WRAPPER_TEMPLATE % {"script": shlex.quote(os.path.join(d, "docker-archive.py")),
+                                  "dest": shlex.quote(os.path.abspath(a.dest))}
+    skill = SKILL_TEMPLATE % {"mark": SKILL_MARK, "ensure": shlex.quote(ensure)}
+    # SKILL.md last, so a half-finished install never points at a missing wrapper
+    return {"docker-archive.py": (script, 0o755), "ensure": (wrapper.encode(), 0o755),
+            "SKILL.md": (skill.encode(), 0o644)}
+
+
+def skill_state(a):
+    base, d = skill_paths()
+    import shlex
+    info = {"path": d, "permission_rule": "Bash(%s:*)" % shlex.quote(os.path.join(d, "ensure"))}
+    if not os.path.isdir(base):
+        return dict(info, state="no-claude")
+    md = os.path.join(d, "SKILL.md")
+    if not os.path.exists(md):
+        return dict(info, state="not-installed")
+    try:
+        with open(md) as f:
+            if SKILL_MARK not in f.read():
+                return dict(info, state="foreign")
+    except OSError:
+        return dict(info, state="foreign")
+    for name, (data, _) in skill_files(a).items():
+        try:
+            with open(os.path.join(d, name), "rb") as f:
+                if f.read() != data:
+                    return dict(info, state="outdated")
+        except OSError:
+            return dict(info, state="outdated")
+    return dict(info, state="installed")
+
+
+def cmd_install_skill(a):
+    st = skill_state(a)
+    if a.status:
+        print(json.dumps(st))
+        return
+    d = st["path"]
+    if st["state"] == "no-claude":
+        die("Claude Code is not set up on this Mac (%s not found)." % skill_paths()[0])
+    if st["state"] == "foreign":
+        die("%s exists but was not installed by docker-archive. Leaving it alone." % d)
+    if a.remove:
+        if st["state"] == "not-installed":
+            print("The Claude Code skill is not installed.")
+            return
+        print("Remove the Claude Code skill: %s" % d)
+        confirm_plan(a.yes, "remove it")
+        for name in skill_files(a):
+            try:
+                os.remove(os.path.join(d, name))
+            except FileNotFoundError:
+                pass
+        try:
+            os.rmdir(d)
+        except OSError:
+            print("  note: %s has other files in it, so the folder was kept" % d)
+        change = "removed"
+    else:
+        if st["state"] == "installed":
+            print("The Claude Code skill is installed and up to date: %s" % d)
+            return
+        change = "updated" if st["state"] == "outdated" else "installed"
+        print("%s the Claude Code skill at %s" % ("Update" if change == "updated" else "Install", d))
+        print("  It lets Claude Code restore an archived project when asked to start it. It never removes anything.")
+        confirm_plan(a.yes, "install it")
+        os.makedirs(d, exist_ok=True)
+        import tempfile
+        for name, (data, mode) in skill_files(a).items():
+            fd, tmp = tempfile.mkstemp(dir=d, prefix="." + name + ".")
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+            os.chmod(tmp, mode)
+            os.replace(tmp, os.path.join(d, name))
+        print("Done. Claude Code picks it up in new sessions.")
+        print("To run it without a permission prompt, add this to permissions.allow in ~/.claude/settings.json:")
+        print("  %s" % st["permission_rule"])
+    if os.path.isdir(a.dest):
+        log_history(a.dest, "skill", "-", change=change)
+
+
 # ---------------------------------------------------------------- main
 
 def main():
@@ -1950,6 +2669,28 @@ def main():
     sc.add_argument("--remove", action="store_true")
     sc.set_defaults(fn=cmd_schedule)
 
+    en = sub.add_parser("ensure", help="make sure a project is in Docker; restore its newest copy if not")
+    en.add_argument("target", help="compose project name, or a folder path such as . for the current folder")
+    en.add_argument("--start", action="store_true", help="start the restored containers and check they stay up")
+    en.add_argument("--restore-anyway", action="store_true",
+                    help="restore a copy even though the project was not archived by docker-archive, or was restored before")
+    en.add_argument("--check-seconds", type=int, default=30, help=argparse.SUPPRESS)
+    en.set_defaults(fn=cmd_ensure)
+
+    sk = sub.add_parser("install-skill", help="install the Claude Code skill that restores projects on request")
+    sk.add_argument("--remove", action="store_true", help="remove the skill")
+    sk.add_argument("--status", action="store_true", help="print the skill state as JSON")
+    sk.add_argument("--yes", action="store_true")
+    sk.set_defaults(fn=cmd_install_skill)
+
+    ai = sub.add_parser("add-images", help="add images no container runs (e.g. base images) to an existing archive")
+    ai.add_argument("archive")
+    ai.add_argument("images", nargs="+", help="image names, e.g. myapp-base:latest")
+    ai.add_argument("--remove", action="store_true",
+                    help="then remove them from Docker (skips any a container or another image still needs)")
+    ai.add_argument("--yes", action="store_true")
+    ai.set_defaults(fn=cmd_add_images)
+
     hi = sub.add_parser("history", help="show the action log")
     hi.add_argument("-n", type=int, default=30)
     hi.set_defaults(fn=cmd_history)
@@ -1973,10 +2714,19 @@ def main():
             log_history(a.dest, "archive" if getattr(a, "remove_after", False) else a.cmd,
                         ",".join(getattr(a, "projects", None) or []) or "-", result=result)
     try:
+        if a.cmd == "install-skill":
+            return a.fn(a)
         if not ok(["docker", "info", "--format", "{{.ServerVersion}}"]):
             die("Docker is not running.")
         resume_leftovers()
-        a.fn(a)
+        try:
+            a.fn(a)
+        finally:
+            if a.cmd in ("backup", "remove", "restore", "delete-backup", "auto", "json"):
+                try:
+                    sync_index(dest_root_of(a.archive) if getattr(a, "archive", None) else a.dest)
+                except Exception:
+                    pass
     except Abort as e:
         if getattr(a, "yes", True) and not (RUN_LOG and str(RUN_LOG[-1]).startswith("failed")):
             record("failed: %s" % e)
