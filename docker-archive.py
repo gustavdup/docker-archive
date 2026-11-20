@@ -466,6 +466,46 @@ def is_short_id(ref):
     return bool(re.match(r"^(sha256:)?[0-9a-f]{12,64}$", ref or ""))
 
 
+def plat_str(p):
+    """'linux/amd64' (plus '/variant') from a platform dict, or None."""
+    if not p or not p.get("os") or not p.get("architecture"):
+        return None
+    return "%s/%s%s" % (p["os"], p["architecture"], "/" + p["variant"] if p.get("variant") else "")
+
+
+def os_arch(s):
+    return "/".join((s or "").split("/")[:2])
+
+
+def native_platform():
+    return run(["docker", "version", "--format", "{{.Server.Os}}/{{.Server.Arch}}"]).strip()
+
+
+def stored_platforms(tag):
+    """Platforms whose content is stored locally for a multi-platform image; None for a plain image."""
+    import urllib.parse
+    try:
+        code, js = api("GET", "/v1.48/images/%s/json?manifests=1" % urllib.parse.quote(tag, safe=""))
+    except Abort:
+        return None
+    if not api_ok(code) or not js.get("Manifests"):
+        return None
+    return [plat_str((m.get("ImageData") or {}).get("Platform")) for m in js["Manifests"]
+            if m.get("Available") and m.get("Kind") == "image"]
+
+
+def save_platform(tag, want, native):
+    """Platform to pass to docker save for this tag, or None to save it the normal way."""
+    avail = [a for a in (stored_platforms(tag) or []) if a]
+    if not avail:
+        return None
+    if want and os_arch(want) in [os_arch(a) for a in avail]:
+        return None if os_arch(want) == os_arch(native) else next(a for a in avail if os_arch(a) == os_arch(want))
+    if os_arch(native) in [os_arch(a) for a in avail]:
+        return None
+    return avail[0]
+
+
 def base_images_for(tags):
     """Tagged images the given images were built on (FROM ...): their layers are the start of a project image's
     layers. No container runs them, but the project's images need them to be rebuilt. Shared layers make this free
@@ -511,6 +551,7 @@ def backup_project(s, dest_root, stamp):
 
 
 def _backup_body(s, name, adir, tmp, helper, manifest, save_tags, tagged):
+    want_platform = {}   # image tag -> platform the container ran as
 
     # ---- containers + images
     for c in s["containers"]:
@@ -519,6 +560,7 @@ def _backup_body(s, name, adir, tmp, helper, manifest, save_tags, tagged):
         service = labels.get("com.docker.compose.service") or cname
         img_id = c["Image"]
         img_name = c["Config"].get("Image") or ""
+        cplat = plat_str((c.get("ImageManifestDescriptor") or {}).get("platform"))
         repo = archive_repo(name, cname)
         img_present = image_id(img_id) is not None
 
@@ -540,6 +582,8 @@ def _backup_body(s, name, adir, tmp, helper, manifest, save_tags, tagged):
             print("  %s: image %s saved as %s" % (cname, (img_name or img_id)[:60], tag))
         if tag:
             save_tags.append(tag)
+            if cplat:
+                want_platform[tag] = cplat
 
         diff = container_diff(c["Id"])
         snapshot, rootfs = None, None
@@ -564,12 +608,15 @@ def _backup_body(s, name, adir, tmp, helper, manifest, save_tags, tagged):
                 print("  WARNING %s: bind mount %s does not exist on the Mac" % (cname, host_path(m["Source"])))
         manifest["containers"].append({
             "name": cname, "id": c["Id"], "service": service,
-            "image_id": img_id, "image_name": img_name, "saved_tag": tag,
+            "image_id": img_id, "image_name": img_name, "saved_tag": tag, "platform": cplat,
             "image_override": override, "retag": retag, "snapshot": snapshot, "rootfs": rootfs,
             "changed_paths": len(diff),
             "bind_mounts": [{"source": host_path(m["Source"]), "dest": m["Destination"]} for m in binds],
             "inspect": c,
         })
+
+    # ---- small bind-mounted files and folders (config, secrets)
+    save_bind_copies(manifest, tmp)
 
     # ---- networks (user-defined ones the containers join)
     nets = sorted({n for c in s["containers"]
@@ -601,22 +648,47 @@ def _backup_body(s, name, adir, tmp, helper, manifest, save_tags, tagged):
     bases = set(base_images_for([t for t in set(save_tags) if t != helper]))
     if bases:
         print("  including %d base image(s) the project's images are built on: %s" % (len(bases), ", ".join(sorted(bases))))
-    tags = sorted(set(save_tags) | bases)
-    print("  saving %d image(s)..." % len(tags))
-    try:
-        run(["docker", "save", "-o", os.path.join(tmp, "images.tar")] + tags, capture=False)
-    except Abort:
-        if not bases:
-            raise
-        print("  WARNING: saving with the base images failed; saving the project's own images only")
-        bases = set()
-        tags = sorted(set(save_tags))
-        run(["docker", "save", "-o", os.path.join(tmp, "images.tar")] + tags, capture=False)
+    native = native_platform()
+    by_plat = {}
+    for t in sorted(set(save_tags) | bases):
+        by_plat.setdefault(save_platform(t, want_platform.get(t), native), []).append(t)
+    files = {}   # tag -> image file, for images not saved in images.tar
+    for plat in sorted(by_plat, key=lambda x: x or ""):
+        group = by_plat[plat]
+        fname = "images.tar" if plat is None else "images-%s.tar" % plat.replace("/", "-")
+        extra = [] if plat is None else ["--platform", plat]
+        print("  saving %d image(s)%s..." % (len(group), "" if plat is None else " for " + plat))
+        try:
+            run(["docker", "save"] + extra + ["-o", os.path.join(tmp, fname)] + group, capture=False)
+        except Abort:
+            own = [t for t in group if t not in bases]
+            if len(own) == len(group):
+                raise
+            print("  WARNING: saving with the base images failed; saving the project's own images only")
+            bases -= set(group)
+            group[:] = own
+            if not own:
+                continue
+            run(["docker", "save"] + extra + ["-o", os.path.join(tmp, fname)] + own, capture=False)
+        if plat is not None:
+            files.update({t: (fname, plat) for t in group})
+    if not os.path.exists(os.path.join(tmp, "images.tar")):   # every image was non-native: keep the format
+        hp = save_platform(helper, None, native)
+        run(["docker", "save"] + (["--platform", hp] if hp else []) + ["-o", os.path.join(tmp, "images.tar"), helper],
+            capture=False)
+    tags = sorted(t for g in by_plat.values() for t in g)
     for t in tags:
         iid = image_id(t)
         info = docker_json(["image", "inspect", t])[0]
-        manifest["images"].append({"tag": t, "id": iid, "all_tags": info.get("RepoTags") or [],
-                                   "base": t in bases})
+        entry = {"tag": t, "id": iid, "all_tags": info.get("RepoTags") or [], "base": t in bases}
+        if t in files:
+            entry["file"], entry["platform"] = files[t]
+            # a single-platform save stores that platform's image, not the multi-platform index
+            ids_in_tar = tar_image_ids(os.path.join(tmp, entry["file"]))
+            if t not in ids_in_tar:
+                die("%s: could not read the ID of %s back from %s" % (name, t, entry["file"]))
+            entry["id"] = ids_in_tar[t]
+        manifest["images"].append(entry)
 
     # ---- volumes (fingerprint before and after: catches writes during the copy)
     for v in s["volumes"]:
@@ -709,7 +781,9 @@ def write_readme(tmp, m):
                 w("  tmpfs:     %s  (memory only, never saved)" % mnt["Destination"])
         for b in c["bind_mounts"]:
             state = "exists on the Mac" if os.path.exists(b["source"]) else "MISSING on the Mac at backup time"
-            w("  Mac folder: %s -> %s  (NOT in this backup, %s)" % (b["source"], b["dest"], state))
+            kept = ("copy in %s" % b["copy"]) if b.get("copy") else \
+                   ("NOT in this backup%s" % ((": " + b["not_copied"]) if b.get("not_copied") else ""))
+            w("  Mac folder: %s -> %s  (%s, %s)" % (b["source"], b["dest"], kept, state))
         w("")
     w("VOLUMES")
     w("-------")
@@ -745,7 +819,8 @@ def write_readme(tmp, m):
     w("  3. recreate containers from the settings in manifest.json (containers[].inspect),")
     w("     or run 'docker compose up' in the project folder using the restored image names.")
     w("")
-    w("SECURITY: compose/.env and manifest.json can contain passwords and API keys in plain text.")
+    w("SECURITY: compose/.env, manifest.json and binds/ (copies of bind-mounted files, often config and")
+    w("secrets) can contain passwords and API keys in plain text.")
     with open(os.path.join(tmp, "README.txt"), "w") as f:
         f.write("\n".join(L) + "\n")
 
@@ -761,6 +836,25 @@ def write_checksums(d):
     lines.sort(key=lambda l: l[66:])
     with open(os.path.join(d, "checksums.sha256"), "w") as f:
         f.write("\n".join(lines) + "\n")
+
+
+def tar_image_ids(path):
+    """{image name: image ID} as stored in an OCI docker save tar (index.json)."""
+    out = {}
+    with tarfile.open(path) as t:
+        try:
+            idx = json.load(t.extractfile("index.json"))
+        except (KeyError, ValueError, AttributeError):
+            return out
+    for e in idx.get("manifests") or []:
+        n = (e.get("annotations") or {}).get("io.containerd.image.name")
+        if n:
+            for pre in ("docker.io/library/", "docker.io/"):
+                if n.startswith(pre):
+                    n = n[len(pre):]
+                    break
+            out[n] = e["digest"]
+    return out
 
 
 def tar_image_names(path):
@@ -805,7 +899,8 @@ def verify_dir(d, quiet=False, need_complete=True, extras_strict=True):
                 listed[line[66:]] = line[:64]
     m = load_manifest(d)
     required = {"manifest.json", "images.tar"} | {v["file"] for v in m["volumes"]} | \
-        {c["rootfs"] for c in m["containers"] if c.get("rootfs")}
+        {c["rootfs"] for c in m["containers"] if c.get("rootfs")} | {i["file"] for i in m["images"] if i.get("file")} | \
+        {b["copy"] for c in m["containers"] for b in c["bind_mounts"] if b.get("kind") == "file"}
     missing = required - set(listed)
     if missing:
         return False, "checksum list is missing: " + ", ".join(sorted(missing))
@@ -820,8 +915,10 @@ def verify_dir(d, quiet=False, need_complete=True, extras_strict=True):
             return False, bad
     try:
         names = tar_image_names(os.path.join(d, "images.tar"))
+        for f in sorted({i["file"] for i in m["images"] if i.get("file")}):
+            names |= tar_image_names(os.path.join(d, f))
     except (tarfile.TarError, OSError) as e:
-        return False, "images.tar unreadable: %s" % e
+        return False, "image file unreadable: %s" % e
     unnamed = [i["tag"] for i in m["images"] if i["tag"] not in names]
     if unnamed:
         return False, "images.tar has no entry named: " + ", ".join(unnamed)
@@ -1155,7 +1252,7 @@ def create_exact(c, image_ref, id_to_name, keep_restart=False, paused=None):
             paused.append((c["name"], pol))
         hc["RestartPolicy"] = {"Name": "no", "MaximumRetryCount": 0}
     # never let Docker auto-start a container whose bind folders are missing
-    if any(not os.path.exists(b["source"]) for b in c["bind_mounts"]):
+    if any(bind_problem(b) for b in c["bind_mounts"]):
         if (hc.get("RestartPolicy") or {}).get("Name") not in (None, "", "no"):
             print("  %s: restart policy set to 'no' because bind mount folders are missing" % c["name"])
             hc["RestartPolicy"] = {"Name": "no", "MaximumRetryCount": 0}
@@ -1177,7 +1274,18 @@ def create_exact(c, image_ref, id_to_name, keep_restart=False, paused=None):
             hc.pop(k, None)
         hc["PublishAllPorts"] = False
         body["NetworkingConfig"] = {}
-    code, js = api("POST", "/containers/create?name=" + c["name"], body)
+    # pass the image's own platform, so an amd64 image on an Apple-chip Mac is created as amd64 again
+    query = "name=" + c["name"]
+    plat = c.get("platform")
+    if not plat:
+        try:
+            ii = docker_json(["image", "inspect", body["Image"]])[0]
+            plat = plat_str({"os": ii.get("Os"), "architecture": ii.get("Architecture"), "variant": ii.get("Variant")})
+        except Abort:
+            plat = None
+    if plat:
+        query += "&platform=" + plat
+    code, js = api("POST", "/containers/create?" + query, body)
     if not api_ok(code):
         die("could not create %s: %s" % (c["name"], js.get("message")))
     for w in js.get("Warnings") or []:
@@ -1239,6 +1347,10 @@ def cmd_restore(a):
     if not good:
         die(msg)
     m = load_manifest(d)
+    moves = folder_moves(a, m)
+    old_wd = (m.get("compose") or {}).get("working_dir")
+    apply_moves(m, moves)
+    fix_compose_hash(m, d, moves, old_wd)
     existing = {c["Name"].lstrip("/") for c in all_containers()}
     clash = [c["name"] for c in m["containers"] if c["name"] in existing]
     existing_vols = set(run(["docker", "volume", "ls", "-q"]).split())
@@ -1249,11 +1361,26 @@ def cmd_restore(a):
     snaps = [c["name"] for c in m["containers"] if c["snapshot"]]
     if snaps:
         print("  from snapshots (files changed inside): %s" % ", ".join(snaps))
+    for o, n in moves:
+        print("  folder %s -> %s" % (o, n))
+    putback = getattr(a, "restore_files", False)
+    wd_now = host_path((m.get("compose") or {}).get("working_dir") or "")
+    if putback and wd_now and not os.path.isdir(wd_now):
+        die("the project folder %s is gone, so files can't be put back into it. If the project moved, choose its new "
+            "folder with --project-folder." % wd_now)
     for c in m["containers"]:
         for b in c["bind_mounts"]:
-            if not os.path.exists(b["source"]):
-                print("  WARNING %s: bind mount source %s is missing; it will not be started"
-                      % (c["name"], b["source"]))
+            if not bind_needed(b):
+                continue
+            if bind_absent(b) and b.get("copy") and putback:
+                print("  %s: %s is missing; it will be put back from the archive" % (c["name"], b["source"]))
+            elif os.path.exists(b["source"]) and bind_absent(b):
+                print("  WARNING %s: %s is an empty folder, but it was %s when archived (Docker creates missing "
+                      "bind sources as empty folders); it will not be started. Add --restore-files to put it back."
+                      % (c["name"], b["source"], "a file" if b.get("kind") == "file" else "a folder with files"))
+            elif not os.path.exists(b["source"]):
+                print("  WARNING %s: bind mount source %s is missing; it will not be started%s"
+                      % (c["name"], b["source"], " (a copy is in the archive: add --restore-files)" if b.get("copy") else ""))
     if clash:
         die("containers already exist: %s. Remove or rename them first." % ", ".join(clash))
     if vclash:
@@ -1262,14 +1389,19 @@ def cmd_restore(a):
 
     root = dest_root_of(d)
     created = {"containers": [], "volumes": [], "networks": []}
+    put = []
     try:
+        if putback:
+            put_back_files(m, d, put)
         res = restore_steps(d, m, a.start, created, a.keep_restart_policy)
     except (Abort, KeyboardInterrupt) as e:
         rollback(created)
+        remove_put_back(put)
         log_history(root, "restore", m["project"], d, result="failed: %s" % e)
         raise
     except Exception as e:
         rollback(created)
+        remove_put_back(put)
         log_history(root, "restore", m["project"], d, result="failed: %r" % e)
         die("unexpected error during restore: %r" % e)
     _print_paused(res["paused"])
@@ -1323,6 +1455,9 @@ def restore_steps(d, m, start, created, keep_restart=False):
     try:
         print("loading images...")
         run(["docker", "load", "-i", os.path.join(d, "images.tar")], capture=False)
+        for f in sorted({i["file"] for i in m["images"] if i.get("file")}):
+            print("loading %s..." % f)
+            run(["docker", "load", "-i", os.path.join(d, f)], capture=False)
         for i in m["images"]:
             if image_id(i["tag"]) != i["id"]:
                 if i.get("base"):
@@ -1368,7 +1503,8 @@ def restore_steps(d, m, start, created, keep_restart=False):
         if c.get("rootfs"):
             tag = archive_repo(m["project"], c["name"]) + ":rootfs"
             print("importing filesystem of %s..." % c["name"])
-            iid = run(["docker", "import", os.path.join(d, c["rootfs"]), tag]).strip()
+            iid = run(["docker", "import"] + (["--platform", c["platform"]] if c.get("platform") else [])
+                      + [os.path.join(d, c["rootfs"]), tag]).strip()
             img_by_tag[tag] = image_id(tag)
             c["snapshot"] = tag
     for c in create_order(m["containers"]):
@@ -1383,7 +1519,7 @@ def restore_steps(d, m, start, created, keep_restart=False):
     failed = []
     if start:
         for c in start_order(m["containers"]):
-            missing = [b["source"] for b in c["bind_mounts"] if not os.path.exists(b["source"])]
+            missing = [b["source"] for b in c["bind_mounts"] if bind_problem(b)]
             if missing:
                 failed.append((c["name"], "bind mount source missing: " + ", ".join(missing)))
                 print("  skipped starting %s (bind mount source missing)" % c["name"])
@@ -1732,8 +1868,18 @@ def archives_data(dest):
             if not os.path.isdir(d):
                 continue
             flags = [f for f in ("COMPLETE", "REMOVING", "REMOVED", "RESTORED") if os.path.exists(os.path.join(d, f))]
-            res.append({"project": proj, "archive": st, "path": d, "size": dir_size(d), "flags": flags,
-                        "partial": st.endswith(".partial")})
+            row = {"project": proj, "archive": st, "path": d, "size": dir_size(d), "flags": flags,
+                   "partial": st.endswith(".partial")}
+            try:
+                m = json.load(open(os.path.join(d, "manifest.json")))
+                wd = host_path((m.get("compose") or {}).get("working_dir") or "")
+                binds = {b["source"]: b for c in m["containers"] for b in c["bind_mounts"]}
+                row.update(folder=wd or None, folder_exists=bool(wd) and os.path.isdir(wd),
+                           binds=len(binds), binds_missing=sum(bind_problem(b) for b in binds.values()),
+                           binds_copied=sum(bool(b.get("copy")) for b in binds.values()))
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+            res.append(row)
     return res
 
 
@@ -1947,6 +2093,251 @@ def cmd_archives(a):
             print("%-60s %9s  %s" % (d, human(size), " ".join(flags)))
 
 
+# ---------------------------------------------------------------- bind mounts: small copies, moved folders
+
+BIND_FILE_MAX = 20 * 1000 ** 2      # copy bind-mounted files up to this size
+BIND_DIR_MAX = 50 * 1000 ** 2       # and folders up to this total size
+BIND_DIR_FILES = 5000               # and this many files
+
+
+def measure_bind(src):
+    """('file'|'dir', size) when small enough to keep a copy in the archive, else (None, reason)."""
+    import stat
+    try:
+        st = os.stat(src)
+    except OSError:
+        return None, "missing"
+    if stat.S_ISREG(st.st_mode):
+        return ("file", st.st_size) if st.st_size <= BIND_FILE_MAX else (None, "too big (%s)" % human(st.st_size))
+    if not stat.S_ISDIR(st.st_mode):
+        return None, "not a file or folder"
+    total, n = 0, 0
+    for r, _, fs in os.walk(src):
+        for f in fs:
+            try:
+                s2 = os.lstat(os.path.join(r, f))
+            except OSError:
+                continue
+            n += 1
+            total += s2.st_size if stat.S_ISREG(s2.st_mode) else 0
+            if total > BIND_DIR_MAX or n > BIND_DIR_FILES:
+                return None, "too big (over %s or %d files)" % (human(BIND_DIR_MAX), BIND_DIR_FILES)
+    return "dir", total
+
+
+def copy_bind(src, dst):
+    """Copy a bind-mounted file or folder (regular files, folders and symlinks only)."""
+    if os.path.isdir(src):
+        def skip(folder, names):   # symlinks, sockets, devices: not copied
+            return [x for x in names if os.path.islink(os.path.join(folder, x)) or not
+                    (os.path.isdir(os.path.join(folder, x)) or os.path.isfile(os.path.join(folder, x)))]
+        shutil.copytree(src, dst, ignore=skip)
+    else:
+        shutil.copy2(src, dst)
+
+
+def save_bind_copies(manifest, tmp):
+    """Keep copies of small bind-mounted files/folders (config, secrets) so a moved or deleted repo can be refilled."""
+    copies = {}
+    for c in manifest["containers"]:
+        for b in c["bind_mounts"]:
+            src = b["source"]
+            if src not in copies:
+                kind, info = measure_bind(src)
+                if kind:
+                    rel = "binds/%03d-%s" % (len([x for x in copies.values() if "copy" in x]) + 1,
+                                             safe_name(os.path.basename(src.rstrip("/"))) or "root")
+                    os.makedirs(os.path.join(tmp, "binds"), exist_ok=True)
+                    try:
+                        copy_bind(src, os.path.join(tmp, rel))
+                        copies[src] = {"copy": rel, "kind": kind, "copy_size": info}
+                    except (OSError, shutil.Error) as e:
+                        p = os.path.join(tmp, rel)
+                        shutil.rmtree(p, ignore_errors=True) if os.path.isdir(p) else \
+                            (os.path.exists(p) and os.remove(p))
+                        copies[src] = {"not_copied": "could not read it (%s)" % (getattr(e, "strerror", None) or e)}
+                else:
+                    copies[src] = {"not_copied": info}
+            b.update(copies[src])
+    done = [s for s, x in copies.items() if "copy" in x]
+    if done:
+        print("  kept a copy of %d bind-mounted file(s)/folder(s) (%s)"
+              % (len(done), human(sum(copies[s]["copy_size"] for s in done))))
+    for s, x in copies.items():
+        if "not_copied" in x and x["not_copied"] not in ("missing", "not a file or folder"):
+            print("  bind mount %s not copied: %s" % (s, x["not_copied"]))
+
+
+def folder_moves(a, m):
+    """[(old, new)] folder mappings for restore: --project-folder and --move-folder OLD NEW."""
+    moves = [tuple(x) for x in (getattr(a, "move_folder", None) or [])]
+    pf = getattr(a, "project_folder", None)
+    if pf:
+        old = (m.get("compose") or {}).get("working_dir")
+        if not old:
+            die("this archive has no project folder recorded. Use --move-folder OLD NEW instead.")
+        moves.insert(0, (host_path(old), pf))
+    out = []
+    for o, n in moves:
+        n = os.path.abspath(os.path.expanduser(n))
+        if not os.path.isdir(n):
+            die("folder not found: %s" % n)
+        out.append((os.path.abspath(os.path.expanduser(host_path(o))).rstrip("/"), n.rstrip("/") or "/"))
+    return sorted(out, key=lambda x: -len(x[0]))   # most specific folder first
+
+
+def moved(path, moves):
+    hp = host_path(path or "")
+    pre = "/host_mnt" if (path or "").startswith("/host_mnt/") else ""
+    for o, n in moves:
+        if hp == o or hp.startswith(o + "/"):
+            return pre + n + hp[len(o):]
+    return path
+
+
+def apply_moves(m, moves):
+    """Point bind mounts and compose labels at the folders the user chose."""
+    if not moves:
+        return
+    for c in m["containers"]:
+        for b in c["bind_mounts"]:
+            b["source"] = moved(b["source"], moves)
+        ins = c["inspect"]
+        hc = ins["HostConfig"]
+        binds = []
+        for x in hc.get("Binds") or []:
+            src, sep, rest = x.partition(":")
+            binds.append(moved(src, moves) + sep + rest if sep and src.startswith("/") else x)
+        if hc.get("Binds"):
+            hc["Binds"] = binds
+        for mnt in (hc.get("Mounts") or []) + (ins.get("Mounts") or []):
+            if mnt.get("Type") == "bind" and mnt.get("Source"):
+                mnt["Source"] = moved(mnt["Source"], moves)
+        labels = ins["Config"].get("Labels") or {}
+        if labels.get("com.docker.compose.project.working_dir"):
+            labels["com.docker.compose.project.working_dir"] = moved(labels["com.docker.compose.project.working_dir"], moves)
+        if labels.get("com.docker.compose.project.config_files"):
+            labels["com.docker.compose.project.config_files"] = ",".join(
+                moved(f, moves) for f in labels["com.docker.compose.project.config_files"].split(","))
+    if m.get("compose") and m["compose"].get("working_dir"):
+        m["compose"]["working_dir"] = moved(m["compose"]["working_dir"], moves)
+
+
+def compose_hashes(project, wd, files, env_file=None, cwd=None):
+    """{service: config hash} as docker compose computes it, or None if compose can't read the files."""
+    cmd = ["docker", "compose", "-p", project, "--project-directory", wd]
+    for f in files:
+        cmd += ["-f", f]
+    if env_file:
+        cmd += ["--env-file", env_file]
+    try:
+        out = subprocess.run(cmd + ["config", "--hash", "*"], cwd=cwd or wd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode:
+        return None
+    h = dict(l.split(None, 1) for l in out.stdout.splitlines() if len(l.split()) == 2)
+    return {k: v.strip() for k, v in h.items()} or None
+
+
+def fix_compose_hash(m, d, moves, old_wd):
+    """After a folder move, compose would see a new config hash and re-create the containers (losing changes made
+    inside them). If the compose files in the new folder are the ones that were archived, store the new hash."""
+    comp = m.get("compose") or {}
+    if not moves or not comp.get("working_dir") or not comp.get("copied"):
+        return
+    wd = host_path(comp["working_dir"])
+    copied = {x["source"]: x["file"] for x in comp["copied"]}
+    if any(f not in copied for f in comp["config_files"]) or not os.path.isdir(wd):
+        return
+    proj = (m["containers"][0]["inspect"]["Config"].get("Labels") or {}).get("com.docker.compose.project")
+    if not proj:
+        return
+    now = compose_hashes(proj, wd, [moved(f, moves) for f in comp["config_files"]])
+    env = os.path.join(d, "compose", ".env") if ".env" in copied.values() else None
+    arch = [os.path.join(d, "compose", copied[f]) for f in comp["config_files"]]
+    then = compose_hashes(proj, wd, arch, env, cwd=d)
+    orig = compose_hashes(proj, host_path(old_wd), arch, env, cwd=d) or {}   # what the containers were made from
+    if not now or now != then:
+        if comp.get("config_files"):
+            print("  note: the compose files in %s differ from the archived ones; compose will re-create the containers" % wd)
+        return
+    for c in m["containers"]:
+        labels = c["inspect"]["Config"].get("Labels") or {}
+        svc = labels.get("com.docker.compose.service")
+        # only when the container matched the archived compose file (no edit was waiting for a compose up)
+        if svc in now and labels.get("com.docker.compose.config-hash") and \
+                labels["com.docker.compose.config-hash"] == orig.get(svc):
+            labels["com.docker.compose.config-hash"] = now[svc]
+
+
+def bind_absent(b, path=None):
+    """Missing, or an empty folder where the archive saved a file or a non-empty folder (Docker creates missing
+    bind sources as empty folders). A symlink, even a broken one, counts as there: it is never written through."""
+    p = path or b["source"]
+    if not os.path.lexists(p):
+        return True
+    if os.path.islink(p) or not os.path.isdir(p) or os.listdir(p):
+        return False
+    return b.get("kind") == "file" or (b.get("kind") == "dir" and b.get("copy_size", 0) > 0)
+
+
+def bind_needed(b):
+    """False for a bind source that was already missing on the Mac at backup time (e.g. Docker VM-only paths)."""
+    return b.get("not_copied") != "missing"
+
+
+def bind_problem(b, path=None):
+    return bind_needed(b) and bind_absent(b, path)
+
+
+def put_back_files(m, d, done):
+    """Copy saved bind files/folders back where the containers expect them, if missing. Never overwrites.
+    Appends each path it creates (and each parent folder it makes) to done, before creating it, for rollback.
+    Only fills in an existing folder: never rebuilds a project folder that is gone."""
+    wd = host_path((m.get("compose") or {}).get("working_dir") or "")
+    seen = set()
+    for b in sorted((b for c in m["containers"] for b in c["bind_mounts"]),
+                    key=lambda b: host_path(b["source"]).count("/")):   # outer folders before files inside them
+        src = host_path(b["source"])
+        if not b.get("copy") or src in seen or not bind_absent(b):
+            continue
+        seen.add(src)
+        parent = os.path.dirname(src)
+        if not os.path.isdir(parent):
+            if not wd or not os.path.isdir(wd) or not parent.startswith(wd.rstrip("/") + "/"):
+                print("  NOT put back %s: its folder %s does not exist" % (src, parent))
+                continue
+            missing, p = [], parent
+            while not os.path.isdir(p):
+                missing.append(p)
+                p = os.path.dirname(p)
+            for p in reversed(missing):
+                done.append(("dir", p))
+                os.mkdir(p)
+        if os.path.isdir(src) and not os.path.islink(src):
+            os.rmdir(src)   # the empty folder Docker made in its place
+            done.append(("emptydir", src))
+        done.append(("copy", src))
+        copy_bind(os.path.join(d, b["copy"]), src)
+        print("  put back %s" % src)
+    return done
+
+
+def remove_put_back(done):
+    """Undo put_back_files: remove what it copied and the folders it made; re-make empty folders it replaced."""
+    for kind, p in reversed(done):
+        try:
+            if kind == "copy" and os.path.lexists(p):
+                shutil.rmtree(p) if os.path.isdir(p) and not os.path.islink(p) else os.remove(p)
+            elif kind == "dir":
+                os.rmdir(p)
+            elif kind == "emptydir" and not os.path.lexists(p):
+                os.mkdir(p)
+        except OSError:
+            pass
+
+
 # ---------------------------------------------------------------- extra images (base images and others no container runs)
 
 EXTRA_LIST = "extra-images.json"
@@ -2094,7 +2485,19 @@ def cmd_add_images(a):
         snap[name] = open(p, "rb").read() if os.path.exists(p) else None
     print("saving images (one copy of each shared layer)...")
     try:
-        run(["docker", "save", "-o", tmp] + [i["tag"] for i in imgs])
+        native = native_platform()
+        plats = {save_platform(i["tag"], None, native) for i in imgs}
+        if len(plats) > 1:
+            die("these images are stored for different platforms (%s). Add them in separate runs."
+                % ", ".join(sorted(p or native for p in plats)))
+        plat = plats.pop()
+        run(["docker", "save"] + (["--platform", plat] if plat else []) + ["-o", tmp] + [i["tag"] for i in imgs])
+        if plat:
+            got = tar_image_ids(tmp)
+            for i in imgs:
+                if i["tag"] not in got:
+                    die("could not read the ID of %s back from the saved file" % i["tag"])
+                i["id"] = got[i["tag"]]
         names = tar_image_names(tmp)
         bad = [i["tag"] for i in imgs if i["tag"] not in names]
         if bad:
@@ -2304,8 +2707,23 @@ def sync_index(dest, copies=None):
         pass
 
 
-def missing_binds(m):
-    return sorted({b["source"] for c in m["containers"] for b in c["bind_mounts"] if not os.path.exists(b["source"])})
+def same_compose(c, wd):
+    """True when the archived compose file(s) of copy c equal the ones in folder wd and c's own folder is gone."""
+    comp = c["m"].get("compose") or {}
+    if not comp.get("copied") or not c["wd"] or os.path.isdir(c["wd"]):
+        return False
+    files = [x for x in comp["copied"] if x["file"] != ".env"]
+    try:
+        return bool(files) and all(open(os.path.join(c["dir"], "compose", x["file"]), "rb").read() ==
+                                   open(os.path.join(wd, os.path.basename(x["source"])), "rb").read() for x in files)
+    except OSError:
+        return False
+
+
+def missing_binds(m, moves=(), refill=False):
+    """Bind sources that would be missing after a restore with these folder moves (and --restore-files)."""
+    return sorted({moved(b["source"], moves) for c in m["containers"] for b in c["bind_mounts"]
+                   if bind_problem(b, moved(b["source"], moves)) and not (refill and b.get("copy"))})
 
 
 def cmd_ensure(a):
@@ -2383,20 +2801,30 @@ def cmd_ensure(a):
             elsewhere(n)
             notes.append("%s is not archived" % n)
             continue
-        mine = [c for c in copies if c["project"] == n and (wd is None or c["wd"] == wd)]
+        pf = getattr(a, "project_folder", None)
+        mine = [c for c in copies if c["project"] == n and (wd is None or pf or c["wd"] == wd)]
         if not mine:
             others = sorted({c["wd"] or "?" for c in copies if c["project"] == n})
             if others:
                 ensure_exit(ENSURE_ASK, "no copy of %s was saved from %s, but there are copies saved from %s. If the "
-                            "folder moved, ask the user, then run: ensure %s" % (n, wd, ", ".join(others), n))
+                            "project moved here, ask the user, then run: ensure %s --project-folder \"%s\""
+                            % (n, wd, ", ".join(others), n, wd))
             if any(sub == safe_name(n) for sub, _ in bad):
                 ensure_exit(ENSURE_ASK, "the drive has copies of %s that can't be read or are from an old version." % n)
             elsewhere(n)
+            if wd:
+                like = sorted({(c["project"], c["wd"]) for c in copies if c["archived"] and same_compose(c, wd)})
+                if like:
+                    ensure_exit(ENSURE_ASK, "no copy of %s was saved, but %s has the same compose file as archived "
+                                "project(s) saved from a folder that is gone: %s. If the project moved here, ask the user, "
+                                "then run: ensure %s --project-folder \"%s\"" % (n, wd, ", ".join(
+                                    "%s (%s)" % x for x in like), like[0][0], wd))
             notes.append("%s has no saved copy" % n)
             continue
-        if wd is None and len({c["wd"] for c in mine}) > 1:
-            ensure_exit(ENSURE_ASK, "copies of %s were saved from several folders (%s). Run ensure from the project's "
-                        "folder instead." % (n, ", ".join(sorted({c["wd"] or "?" for c in mine}))))
+        if (wd is None or pf) and len({c["wd"] for c in mine}) > 1:
+            ensure_exit(ENSURE_ASK, "copies of %s were saved from several folders (%s). %s" % (
+                n, ", ".join(sorted({c["wd"] or "?" for c in mine})),
+                "Ask the user which one this is." if pf else "Run ensure from the project's folder instead."))
         archived = [c for c in mine if c["archived"]]
         pick = max(archived or mine, key=lambda c: c["stamp"])
         vols = [v["name"] for v in pick["m"]["volumes"]]
@@ -2426,10 +2854,26 @@ def cmd_ensure(a):
         todo.append((n, pick))
 
     for n, c in todo:
-        holes = missing_binds(c["m"])
+        pf = getattr(a, "project_folder", None)
+        mv = folder_moves(argparse.Namespace(project_folder=pf), c["m"]) if pf else []
+        holes = missing_binds(c["m"], mv, a.restore_files)
+        if holes and not a.restore_anyway:
+            kept = sorted({moved(b["source"], mv) for x in c["m"]["containers"] for b in x["bind_mounts"]
+                           if b.get("copy") and moved(b["source"], mv) in holes})
+            wd0 = (c["m"].get("compose") or {}).get("working_dir")
+            gone = wd0 and not pf and not os.path.isdir(host_path(wd0))
+            ensure_exit(ENSURE_ASK, "%s is archived, but %d bind-mounted file(s)/folder(s) it needs are missing: %s. "
+                        "Nothing was restored. Ask the user.%s%s Or restore anyway with --restore-anyway (containers are "
+                        "not started; Docker would create missing ones empty)." % (
+                            n, len(holes), ", ".join(holes),
+                            (" Its folder %s is gone: if the project moved, run ensure from the new folder with "
+                             "--project-folder \"<new folder>\"." % host_path(wd0)) if gone else "",
+                            (" The archive has copies of %d of them: add --restore-files%s to put them back."
+                             % (len(kept), " (with --project-folder)" if gone else "")) if kept else ""))
         print("%s: restoring the copy %s" % (n, c["dir"]))
         ra = argparse.Namespace(archive=c["dir"], start=a.start and not holes, keep_restart_policy=True,
-                                keep_backup=True, check_seconds=a.check_seconds, yes=True)
+                                keep_backup=True, check_seconds=a.check_seconds, yes=True,
+                                project_folder=pf, move_folder=None, restore_files=a.restore_files)
         try:
             outcome = cmd_restore(ra)
         except Abort as e:
@@ -2437,11 +2881,13 @@ def cmd_ensure(a):
         finally:
             sync_index(a.dest)
         if holes:
-            ensure_exit(ENSURE_ASK, "restored %s (not started), but these bind-mount folders are missing: %s. Ask the "
-                        "user before starting it: Docker would create them empty." % (n, ", ".join(holes)))
+            ensure_exit(ENSURE_ASK, "restored %s (not started); these bind-mount files/folders are still missing: %s. "
+                        "Ask the user before starting it." % (n, ", ".join(holes)))
         if outcome in ("problems", "unhealthy"):
             ensure_exit(ENSURE_ASK, "restored %s, but not every container started and stayed up (see above)." % n)
         notes.append("restored %s%s" % (n, " and started it" if a.start else ""))
+        if pf and compose_dir_of(pf) and compose_name(compose_dir_of(pf)) != n:
+            notes.append("the folder's name differs from the project's, so start it with: docker compose -p %s up -d" % n)
     ensure_exit(ENSURE_READY, "%s. Start the project as usual." % "; ".join(notes))
 
 
@@ -2488,7 +2934,9 @@ Add `--start` to let ensure start the restored containers and check they stay up
 ## Rules
 
 - Only restore. Never back up, archive, remove projects from Docker, or delete saved copies. Those change or delete data; the user does them in the Archive tab in Docker Desktop.
-- Use `--restore-anyway` only after the user says so (exit 4 explains when).
+- Use `--restore-anyway`, `--project-folder` and `--restore-files` only after the user says so (exit 4 explains when).
+  - `--project-folder "<folder>"`: the project was moved; restore it pointing at its new folder.
+  - `--restore-files`: put back config and secrets files the archive kept copies of. It never overwrites a file.
 - Don't create missing bind-mount folders or delete volumes to get past exit 4. Ask the user.
 """
 
@@ -2627,6 +3075,12 @@ def main():
                     help="keep the backup even after a successful restore (default: delete it)")
     rs.add_argument("--check-seconds", type=int, default=30,
                     help="how long containers must stay up before the backup is deleted")
+    rs.add_argument("--project-folder", metavar="PATH",
+                    help="the project folder has moved: point bind mounts and compose labels at PATH")
+    rs.add_argument("--move-folder", nargs=2, action="append", metavar=("OLD", "NEW"),
+                    help="map any other moved folder used by bind mounts (repeatable)")
+    rs.add_argument("--restore-files", action="store_true",
+                    help="put back missing bind-mounted files/folders from the copies kept in the archive")
     rs.add_argument("--yes", action="store_true")
     rs.set_defaults(fn=cmd_restore)
 
@@ -2673,7 +3127,11 @@ def main():
     en.add_argument("target", help="compose project name, or a folder path such as . for the current folder")
     en.add_argument("--start", action="store_true", help="start the restored containers and check they stay up")
     en.add_argument("--restore-anyway", action="store_true",
-                    help="restore a copy even though the project was not archived by docker-archive, or was restored before")
+                    help="restore a copy even though the project was not archived by docker-archive, was restored "
+                         "before, or misses bind-mounted files")
+    en.add_argument("--project-folder", metavar="PATH", help="the project folder has moved here (see restore)")
+    en.add_argument("--restore-files", action="store_true",
+                    help="put back missing bind-mounted files from the archive's copies")
     en.add_argument("--check-seconds", type=int, default=30, help=argparse.SUPPRESS)
     en.set_defaults(fn=cmd_ensure)
 

@@ -421,9 +421,26 @@ function renderArchives(list) {
            <label><input type="checkbox" class="kb"> Keep this archive afterwards</label>
            <label><input type="checkbox" class="kr"> Keep auto-start</label></span>
            <button class="act go">Restore</button><button class="ghost no">Cancel</button></div>
+           ${a.folder ? `<div class="row-act" style="margin-top:8px"><label class="small" for="pf-${esc(a.archive)}">Project folder</label>
+             <input type="text" class="pf" id="pf-${esc(a.archive)}" size="48" value="${esc(a.folder)}">
+             <button class="ghost br">Browse…</button></div>
+             ${a.folder_exists ? "" : `<p class="small" style="margin:4px 0 0;color:var(--warn)">This folder is not there any more. If you moved the project, choose where it is now: bind mounts and compose labels are pointed at the new folder.</p>`}` : ""}
+           ${a.binds_copied ? `<div class="opts" style="margin-top:6px"><label><input type="checkbox" class="rf" checked> Put back missing config files saved in the archive (${a.binds_copied} kept; existing files are never overwritten)</label></div>` : ""}
            <p class="mut small" style="margin:6px 0 0">With "Start it", the archive is deleted only after every volume matches and all containers stay healthy.</p>`;
+         const br = d.querySelector(".br");
+         if (br) br.onclick = async () => {
+           const r = await dd.desktopUI.dialog.showOpenDialog({ properties: ["openDirectory"] });
+           if (!r.canceled && r.filePaths.length) d.querySelector(".pf").value = r.filePaths[0];
+         };
          d.querySelector(".go").onclick = () => {
            const args = ["restore", a.path, "--yes"];
+           const pf = d.querySelector(".pf"), rf = d.querySelector(".rf");
+           const moved = pf && pf.value.trim() && pf.value.trim().replace(/\/+$/, "") !== a.folder;
+           if (moved) args.push("--project-folder", pf.value.trim());
+           if (rf && rf.checked) {
+             if (a.folder && !a.folder_exists && !moved) { dd.desktopUI.toast.warning("Choose where the project folder is now, or untick “Put back missing config files”."); return; }
+             args.push("--restore-files");
+           }
            if (d.querySelector(".st").checked) args.push("--start");
            if (d.querySelector(".kb").checked) args.push("--keep-backup");
            if (d.querySelector(".kr").checked) args.push("--keep-restart-policy");

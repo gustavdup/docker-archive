@@ -44,6 +44,7 @@ It comes as a single Python script (stdlib only) and an optional Docker Desktop 
 ./docker-archive.py remove  <archive dir> --yes  # remove a backed-up project from Docker
 ./docker-archive.py restore <archive dir> --start --yes      # restore; deletes the archive once healthy
 ./docker-archive.py restore <archive dir> --start --keep-backup --yes
+./docker-archive.py restore <archive dir> --project-folder ~/code/myproject --restore-files --yes   # the repo moved
 ./docker-archive.py delete-backup <archive dir> --yes
 ./docker-archive.py history                      # every action, including failed and interrupted ones
 ./docker-archive.py ensure .                     # restore the project in this folder if it is not in Docker
@@ -128,9 +129,20 @@ Each copy is a folder `<drive>/docker-archive/<project>/<timestamp>/` with:
 - `manifest.json`: the full container config
 - snapshots of containers with changed files inside them
 - `compose/`: copies of the compose files and `.env`
+- `binds/`: copies of small bind-mounted files and folders (see below)
 - `checksums.sha256` and a `README.txt` explaining the folder
 
-Bind-mounted folders (files in your repos) are not copied. They stay where they are.
+### Bind mounts and moved projects
+
+Bind-mounted files stay in your repo. So that a project still starts after its repo moved or lost an untracked file, a backup also keeps a copy of each small bind-mounted file (up to 20 MB) and folder (up to 50 MB and 5,000 files; symlinks are skipped). These are often config and secrets files, so treat the drive as holding secrets.
+
+When restoring:
+
+- `--project-folder PATH`: the project folder moved. Bind mounts and compose labels are pointed at the new folder, so `docker compose up` from there uses the restored containers. If the folder name changed, start it with `docker compose -p <project> up -d`.
+- `--move-folder OLD NEW`: the same for any other folder a bind mount uses (repeatable).
+- `--restore-files`: put back bind-mounted files and folders that are missing, from the archive's copies. It never overwrites an existing file. An empty folder where a file used to be (Docker creates those when a bind source is missing) counts as missing.
+
+The extension's Restore panel has a Project folder field with Browse, and a note when the original folder is gone. `ensure` stops and asks (exit 4) when bind-mounted files would be missing, and suggests these options.
 
 ## Safety
 

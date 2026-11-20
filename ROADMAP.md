@@ -9,12 +9,14 @@ Done:
 - Automatic backups every N days (running projects skipped or paused).
 - Automatic archiving of projects idle X weeks. Battery limit. Daily launchd check.
 - Docker Desktop extension (macOS).
+- Base images archived with the project; `add-images` for leftover images.
+- Containers are re-created with their image's platform (amd64 images on Apple chips).
+- `ensure` and a Claude Code skill to restore a project before it starts.
+- Small bind-mounted files kept in archives; restore into a moved project folder (`--project-folder`, `--restore-files`).
 
 Open:
 - Round trip of containers with bind mounts from Docker Desktop's `/host_mnt` paths.
 - Test with large projects (20 GB+ of images).
-- Archive unused images that no container uses.
 - Volume copies use busybox tar: extended attributes are dropped and sparse files are expanded.
-- Image platform is not passed when containers are re-created.
 - Linux support (battery, launchd and the drive check are macOS-only).
 - Publish the extension so it installs without turning off the Marketplace-only setting.
