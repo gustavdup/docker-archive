@@ -1,0 +1,6 @@
+docker-archive-extension/darwin/
+__pycache__/
+*.pyc
+.DS_Store
+history.jsonl
+settings.json

@@ -1,0 +1,9 @@
+{
+  "icon": "icon.svg",
+  "ui": {
+    "dashboard-tab": { "title": "Archive", "root": "/ui", "src": "index.html" }
+  },
+  "host": {
+    "binaries": [ { "darwin": [ { "path": "/darwin/docker-archive" } ] } ]
+  }
+}

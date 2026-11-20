@@ -1,0 +1,540 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Docker Archive</title>
+<style>
+  :root { --bg:#ffffff; --surface:#f5f7fa; --fg:#0f172a; --mut:#526075; --line:#dde3ea; --acc:#1d63ed; --acc-fg:#fff;
+          --ok:#15803d; --ok-bg:#dcfce7; --warn:#a16207; --warn-bg:#fef3c7; --bad:#b91c1c; --bad-bg:#fee2e2; --hover:#eef2f7; --ring:#1d63ed; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0f172a; --surface:#1e293b; --fg:#f1f5f9; --mut:#9fb0c6; --line:#334155; --acc:#5b8def; --acc-fg:#0b1220;
+            --ok:#4ade80; --ok-bg:#14532d; --warn:#fbbf24; --warn-bg:#422006; --bad:#f87171; --bad-bg:#450a0a; --hover:#243247; --ring:#93b4f5; } }
+  * { box-sizing:border-box; }
+  body { background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; margin:0; padding:16px 20px 24px; }
+  h1 { font-size:18px; font-weight:600; margin:0; }
+  h2 { font-size:15px; font-weight:600; margin:0 0 8px; }
+  .mut { color:var(--mut); } .small { font-size:12px; }
+  .top { display:flex; justify-content:space-between; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:12px; }
+  .bar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; background:var(--surface); padding:10px 12px; border-radius:10px; margin-bottom:12px; }
+  .bar label { font-weight:500; }
+  .badge { display:inline-flex; align-items:center; gap:6px; padding:2px 9px; border-radius:999px; font-size:12px; font-weight:500; white-space:nowrap; }
+  .badge svg { width:12px; height:12px; }
+  .b-ok { background:var(--ok-bg); color:var(--ok); } .b-warn { background:var(--warn-bg); color:var(--warn); }
+  .b-bad { background:var(--bad-bg); color:var(--bad); } .b-mut { background:var(--surface); color:var(--mut); border:1px solid var(--line); }
+  .kpis { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:10px; margin-bottom:14px; }
+  .kpi { background:var(--surface); border-radius:10px; padding:10px 14px; }
+  .kpi .v { font-size:20px; font-weight:600; font-variant-numeric:tabular-nums; }
+  .kpi .l { font-size:12px; color:var(--mut); }
+  .tabs { display:flex; gap:4px; border-bottom:1px solid var(--line); margin-bottom:12px; }
+  .tab { background:none; color:var(--mut); border:0; border-bottom:2px solid transparent; border-radius:0; padding:8px 12px; font-size:14px; font-weight:500; min-height:36px; }
+  .tab:hover { color:var(--fg); background:none; }
+  .tab[aria-selected=true] { color:var(--acc); border-bottom-color:var(--acc); }
+  .panel[hidden] { display:none; }
+  input[type=text], input[type=number] { background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:5px 8px; min-height:32px; font:inherit; }
+  input[type=number] { width:70px; }
+  input[type=checkbox] { width:16px; height:16px; accent-color:var(--acc); cursor:pointer; }
+  button { background:var(--acc); color:var(--acc-fg); border:1px solid transparent; border-radius:6px; padding:5px 12px; min-height:32px; cursor:pointer;
+           font:500 13px/1 inherit; font-family:inherit; display:inline-flex; align-items:center; gap:6px; transition:filter .15s, background .15s; }
+  button:hover { filter:brightness(1.08); }
+  button.ghost { background:transparent; color:var(--fg); border-color:var(--line); }
+  button.ghost:hover { background:var(--hover); filter:none; }
+  button.danger { background:var(--bad); color:#fff; }
+  button:disabled { opacity:.45; cursor:not-allowed; filter:none; }
+  button svg { width:14px; height:14px; }
+  :focus-visible { outline:2px solid var(--ring); outline-offset:2px; }
+  .tablewrap { border:1px solid var(--line); border-radius:10px; overflow:auto; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  tr:last-child td { border-bottom:0; }
+  th { color:var(--mut); font-weight:500; font-size:12px; background:var(--surface); position:sticky; top:0; }
+  tbody tr:hover td { background:var(--hover); }
+  td.num, th.num { text-align:right; font-variant-numeric:tabular-nums; white-space:nowrap; }
+  tr.sub td { background:var(--surface); font-size:12px; }
+  .expander { background:none; border:0; color:var(--fg); padding:0; min-height:0; font-weight:500; font-size:14px; gap:4px; }
+  .expander:hover { background:none; filter:none; color:var(--acc); }
+  .expander svg { transition:transform .15s; }
+  .expander[aria-expanded=true] svg { transform:rotate(90deg); }
+  .row-act { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .opts { display:flex; gap:10px; flex-wrap:wrap; font-size:12px; }
+  .opts label { display:flex; gap:4px; align-items:center; cursor:pointer; }
+  .danger-zone { display:flex; gap:6px; align-items:center; padding-left:10px; border-left:2px solid var(--bad-bg); }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:12px; }
+  .card { background:var(--surface); border-radius:10px; padding:14px; }
+  .card .f { display:flex; gap:8px; align-items:center; margin:8px 0; flex-wrap:wrap; }
+  .empty { padding:24px; text-align:center; color:var(--mut); }
+  details.logbox { margin-top:16px; }
+  details.logbox summary { cursor:pointer; font-weight:600; padding:6px 0; }
+  #log { background:#0b1020; color:#d6deeb; font:12px/1.45 ui-monospace, Menlo, monospace; padding:10px 12px; border-radius:8px; height:240px; overflow:auto; white-space:pre-wrap; margin-top:6px; }
+  .spin { width:14px; height:14px; border:2px solid currentColor; border-right-color:transparent; border-radius:50%; animation:sp .8s linear infinite; }
+  @keyframes sp { to { transform:rotate(360deg); } }
+  .runbar { position:sticky; top:0; z-index:20; display:flex; align-items:center; gap:10px; flex-wrap:wrap;
+            margin:-16px -20px 12px; padding:10px 20px; background:var(--acc); color:var(--acc-fg); font-weight:500; }
+  .runbar[hidden] { display:none; }
+  .runbar.done { background:var(--ok-bg); color:var(--ok); }
+  .runbar.fail { background:var(--bad-bg); color:var(--bad); }
+  .runbar .last { font:12px ui-monospace, Menlo, monospace; opacity:.9; flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .runbar a { color:inherit; text-decoration:underline; font-weight:600; white-space:nowrap; }
+  .runbar .x { background:none; border:0; color:inherit; min-height:0; padding:0 4px; font-size:16px; }
+  tr.drawer td { background:var(--surface); padding:12px 14px; }
+  tr.drawer .row-act { gap:10px; }
+  tr.open td { background:var(--hover); }
+  .acts { display:flex; gap:6px; flex-wrap:nowrap; justify-content:flex-end; }
+  .acts button { white-space:nowrap; }
+  .when { white-space:nowrap; font-variant-numeric:tabular-nums; }
+  .acard { background:var(--surface); border-radius:12px; padding:16px; display:flex; flex-direction:column; gap:12px; }
+  .acard header { display:flex; justify-content:space-between; align-items:flex-start; gap:12px; }
+  .acard header p { margin:2px 0 0; }
+  .acard .body { display:flex; flex-direction:column; gap:10px; transition:opacity .15s; }
+  .acard.off .body { opacity:.5; }
+  .srow { display:flex; justify-content:space-between; align-items:center; gap:12px; min-height:34px; }
+  .srow > label, .srow > span:first-child { color:var(--fg); }
+  .srow .ctl { display:flex; align-items:center; gap:6px; white-space:nowrap; color:var(--mut); }
+  .acard input[type=number] { width:64px; text-align:right; }
+  .acard select { background:var(--bg); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:5px 8px; min-height:32px; font:inherit; }
+  .switch { position:relative; width:40px; height:22px; flex:none; }
+  .switch input { position:absolute; inset:0; opacity:0; width:100%; height:100%; margin:0; cursor:pointer; z-index:1; }
+  .switch span { position:absolute; inset:0; background:var(--line); border-radius:999px; transition:background .15s; pointer-events:none; }
+  .switch span::after { content:""; position:absolute; top:3px; left:3px; width:16px; height:16px; border-radius:50%; background:#fff; transition:transform .15s; }
+  .switch input:checked + span { background:var(--acc); }
+  .switch input:checked + span::after { transform:translateX(18px); }
+  .switch input:focus-visible + span { outline:2px solid var(--ring); outline-offset:2px; }
+  .seg { display:inline-flex; border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+  .seg label { padding:5px 10px; cursor:pointer; font-size:13px; color:var(--mut); position:relative; }
+  .seg label + label { border-left:1px solid var(--line); }
+  .seg input { position:absolute; opacity:0; width:0; height:0; }
+  .seg label:has(input:checked) { background:var(--acc); color:var(--acc-fg); }
+  .seg label:has(input:focus-visible) { outline:2px solid var(--ring); outline-offset:-2px; }
+  .callout { display:flex; gap:8px; background:var(--warn-bg); color:var(--fg); border-radius:8px; padding:10px 12px; font-size:12px; line-height:1.5; }
+  .callout svg { width:16px; height:16px; color:var(--warn); flex:none; margin-top:1px; }
+  .hint { font-size:12px; color:var(--mut); margin:0; }
+  .savebar { display:flex; justify-content:flex-end; align-items:center; gap:10px; margin-top:12px; }
+  @media (prefers-reduced-motion: reduce) { * { transition:none !important; animation:none !important; } }
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute">
+  <symbol id="i-chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-dot" viewBox="0 0 24 24"><circle cx="12" cy="12" r="6" fill="currentColor"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></symbol>
+  <symbol id="i-warn" viewBox="0 0 24 24"><path d="M12 3l10 18H2zM12 10v5M12 18v.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2L4 14h7l-1 8 9-12h-7z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></symbol>
+</svg>
+
+<div class="runbar" id="runbar" hidden role="status" aria-live="polite">
+  <span class="spin" id="runspin"></span>
+  <span id="runtitle">Running…</span>
+  <span class="last" id="runlast"></span>
+  <a href="#logbox" onclick="openLog()">View log ↓</a>
+  <button class="x" id="runclose" onclick="$('runbar').hidden = true" aria-label="Dismiss" hidden>×</button>
+</div>
+
+<div class="top">
+  <h1>Docker Archive</h1>
+  <div class="row-act">
+    <span id="drive" class="badge b-mut">Checking drive…</span>
+    <span id="batt" class="badge b-mut">…</span>
+    <button class="ghost" onclick="refresh()" aria-label="Refresh"><svg><use href="#i-refresh"/></svg>Refresh</button>
+  </div>
+</div>
+
+<div class="bar">
+  <label for="dest">Archive folder</label>
+  <input id="dest" type="text" size="48" aria-describedby="desthelp">
+  <button class="ghost" onclick="pickDest()"><svg><use href="#i-folder"/></svg>Browse…</button>
+  <button class="ghost" onclick="saveDest()">Use this folder</button>
+  <span id="desthelp" class="mut small">Must be on an external drive.</span>
+</div>
+
+<div class="kpis">
+  <div class="kpi"><div class="v" id="k-proj">–</div><div class="l">projects in Docker</div></div>
+  <div class="kpi"><div class="v" id="k-idle">–</div><div class="l">idle 8+ weeks</div></div>
+  <div class="kpi"><div class="v" id="k-free">–</div><div class="l">could be freed by removing</div></div>
+  <div class="kpi"><div class="v" id="k-bk">–</div><div class="l">backups &amp; archives on the drive</div></div>
+</div>
+
+<div class="tabs" role="tablist">
+  <button class="tab" role="tab" aria-selected="true" data-tab="projects">Projects</button>
+  <button class="tab" role="tab" aria-selected="false" data-tab="backups">Archives &amp; backups</button>
+  <button class="tab" role="tab" aria-selected="false" data-tab="auto">Automation</button>
+  <button class="tab" role="tab" aria-selected="false" data-tab="history">History</button>
+</div>
+
+<section class="panel" id="p-projects" role="tabpanel">
+  <div class="row-act" style="margin-bottom:10px">
+    <button id="arbtn" onclick="saveSelected('archive')" disabled>Archive</button>
+    <button id="bkbtn" class="ghost" onclick="saveSelected('backup')" disabled>Back up</button>
+    <span class="mut small"><strong>Back up</strong>: copy to the drive, project stays in Docker.
+      <strong>Archive</strong>: copy, then remove from Docker to free the space.</span>
+  </div>
+  <div id="confirmbox" class="card" style="margin-bottom:10px;border:1px solid var(--warn)" hidden>
+    <p style="margin:0 0 8px"><strong id="cftitle"></strong></p>
+    <p class="small" id="cfbody" style="margin:0 0 8px">Each project is copied to the drive and checked. <strong>When that succeeds, the project is removed
+      from Docker</strong> (containers, volumes and images). The archive on the drive becomes the only copy. You can restore it any time
+      from the Archives tab. If any check fails, the project stays in Docker.</p>
+    <div class="row-act"><button id="cfgo">Archive and remove from Docker</button><button class="ghost" onclick="$('confirmbox').hidden = true">Cancel</button></div>
+  </div>
+  <div class="tablewrap"><table id="ptable"><thead><tr><th style="width:32px"><span class="sr" hidden>Select</span></th><th>Project</th><th>Status</th><th class="num">Idle</th><th class="num">Frees if removed</th><th>Saved copies</th></tr></thead>
+  <tbody><tr><td colspan="6" class="empty"><span class="spin" style="display:inline-block;vertical-align:middle"></span> Loading projects…</td></tr></tbody></table></div>
+</section>
+
+<section class="panel" id="p-backups" role="tabpanel" hidden>
+  <div class="tablewrap"><table id="atable"><thead><tr><th>Project</th><th>Saved</th><th class="num">Size</th><th>Status</th><th style="text-align:right">Actions</th></tr></thead><tbody></tbody></table></div>
+  <p class="mut small"><strong>Backup</strong>: project is still in Docker. <strong>Archived</strong>: project was removed from Docker, this is the only copy.
+    <strong>Outdated</strong>: project was restored from it and may have changed since.</p>
+</section>
+
+<section class="panel" id="p-auto" role="tabpanel" hidden>
+  <div class="grid">
+    <div class="acard" id="c-bk">
+      <header><div><h2>Automatic backups</h2><p class="hint">Time-based copies. Projects stay in Docker.</p></div>
+        <span class="switch"><input type="checkbox" id="ben" aria-label="Automatic backups on"><span></span></span></header>
+      <div class="body">
+        <div class="srow"><label for="bdays">Back up every</label><span class="ctl"><input id="bdays" type="number" min="1"> days</span></div>
+        <div class="srow"><label for="maxb">Backups to keep</label><span class="ctl"><input id="maxb" type="number" min="1"> per project</span></div>
+        <div class="srow"><span>Running projects</span>
+          <span class="seg" role="radiogroup" aria-label="Running projects">
+            <label><input type="radio" name="brun" value="skip">Skip</label><label><input type="radio" name="brun" value="pause">Pause while copying</label></span></div>
+        <p class="hint" id="bhint"></p>
+      </div>
+    </div>
+    <div class="acard" id="c-ar">
+      <header><div><h2>Automatic archiving</h2><p class="hint">Age-based. Frees space by moving idle projects to the drive.</p></div>
+        <span class="switch"><input type="checkbox" id="aen" aria-label="Automatic archiving on"><span></span></span></header>
+      <div class="body">
+        <div class="srow"><label for="aweeks">Archive when idle for</label><span class="ctl"><input id="aweeks" type="number" min="1"> weeks</span></div>
+        <div class="callout"><svg><use href="#i-warn"/></svg><span>Archived projects are <strong>removed from Docker</strong>. The archive becomes the only
+          copy and is never deleted automatically. Each removal is verified first. Running projects are never archived.</span></div>
+      </div>
+    </div>
+    <div class="acard">
+      <header><div><h2>Daily check</h2><p class="hint">Runs the automatic backups and archiving once a day.</p></div>
+        <span id="schedbadge" class="badge b-mut">Off</span></header>
+      <div class="body">
+        <p class="hint" id="schedhint">Switches on by itself when you turn on automatic backups or archiving and save.</p>
+        <div class="srow"><label for="ahour">Run at</label><span class="ctl"><select id="ahour"><option value="0">00:00</option><option value="1">01:00</option><option value="2">02:00</option><option value="3">03:00</option><option value="4">04:00</option><option value="5">05:00</option><option value="6">06:00</option><option value="7">07:00</option><option value="8">08:00</option><option value="9">09:00</option><option value="10">10:00</option><option value="11">11:00</option><option value="12">12:00</option><option value="13">13:00</option><option value="14">14:00</option><option value="15">15:00</option><option value="16">16:00</option><option value="17">17:00</option><option value="18">18:00</option><option value="19">19:00</option><option value="20">20:00</option><option value="21">21:00</option><option value="22">22:00</option><option value="23">23:00</option></select></span></div>
+        <div class="srow"><label for="abatt">On battery, only above</label><span class="ctl"><input id="abatt" type="number" min="0" max="100"> %</span></div>
+        <p class="hint">Always runs when plugged in. Skips when the drive isn't connected.</p>
+        <div class="row-act"><button class="ghost" onclick="runAuto()"><svg><use href="#i-bolt"/></svg>Run check now</button></div>
+      </div>
+    </div>
+  </div>
+  <div class="savebar"><span id="dirty" class="mut small"></span><button id="savebtn" onclick="saveAll()" disabled>Save changes</button></div>
+</section>
+
+<section class="panel" id="p-history" role="tabpanel" hidden>
+  <div class="tablewrap"><table id="htable"><thead><tr><th>Time</th><th>Action</th><th>Project</th><th>Result</th><th>Details</th></tr></thead><tbody></tbody></table></div>
+</section>
+
+<details class="logbox" id="logbox"><summary>Activity log <span id="busy" class="mut small"></span></summary><div id="log" aria-live="polite"></div></details>
+
+<script>
+const dd = window.ddClient;
+const BIN = "docker-archive";
+const DEFAULT_DEST = "/Volumes/External-SSD/docker-archive";
+let dest = (() => { try { return localStorage.getItem("dest") || DEFAULT_DEST; } catch (e) { return DEFAULT_DEST; } })();
+let busy = false, status = null, open = {};
+const $ = id => document.getElementById(id);
+const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const human = n => { n = +n || 0; for (const u of ["B","KB","MB","GB","TB"]) { if (n < 1000 || u === "TB") return (u === "B" || u === "KB" ? n.toFixed(0) : n.toFixed(1)) + " " + u; n /= 1000; } };
+
+const badge = (cls, text, icon) => `<span class="badge ${cls}">${icon ? '<svg><use href="#i-dot"/></svg>' : ""}${esc(text)}</span>`;
+document.querySelectorAll(".tab").forEach(t => t.onclick = () => {
+  document.querySelectorAll(".tab").forEach(x => x.setAttribute("aria-selected", x === t));
+  document.querySelectorAll(".panel").forEach(p => p.hidden = p.id !== "p-" + t.dataset.tab);
+});
+const ACTION = { backup: "Archiving", remove: "Removing from Docker", restore: "Restoring", "delete-backup": "Deleting archive",
+                 auto: "Running daily check", schedule: "Updating daily check" };
+function describe(args) {
+  const verb = ACTION[args[0]] || args[0];
+  if (args[0] === "backup") return (args.includes("--remove-after") ? "Archiving " : "Backing up ") + args.slice(1).filter(x => !x.startsWith("--")).join(", ");
+  if (["remove", "restore", "delete-backup"].includes(args[0])) {
+    const parts = args[1].split("/"); return verb + " " + parts[parts.length - 2] + " (" + parts[parts.length - 1] + ")";
+  }
+  return verb;
+}
+function openLog() { $("logbox").open = true; setTimeout(() => $("logbox").scrollIntoView({ behavior: "smooth" }), 0); }
+let lastLine = "";
+function log(t) {
+  const lines = String(t).split("\n").map(x => x.trim()).filter(Boolean);
+  if (lines.length) { lastLine = lines[lines.length - 1]; $("runlast").textContent = lastLine; } const l = $("log"); l.textContent += t; l.scrollTop = l.scrollHeight; }
+
+async function call(args) {           // short command, returns stdout
+  const r = await dd.extension.host.cli.exec(BIN, ["--dest", dest].concat(args));
+  if (r.code && r.code !== 0) throw new Error(r.stderr || ("exit " + r.code));
+  return r.stdout;
+}
+async function json(what) { return JSON.parse(await call(["json", what])); }
+
+function stream(args, done) {         // long command with live log
+  if (busy) { dd.desktopUI.toast.warning("Another action is still running."); return; }
+  busy = true; setButtons(); $("logbox").open = true;
+  const rb = $("runbar"); rb.className = "runbar"; rb.hidden = false; $("runspin").hidden = false; $("runclose").hidden = true;
+  $("runtitle").textContent = describe(args) + "…"; $("runlast").textContent = "";
+  $("busy").innerHTML = '· <span class="spin" style="display:inline-block;vertical-align:middle"></span> running';
+  log("\n$ docker-archive " + args.join(" ") + "\n");
+  dd.extension.host.cli.exec(BIN, ["--dest", dest].concat(args), {
+    stream: {
+      onOutput(d) { if (d.stdout) log(d.stdout); if (d.stderr) log(d.stderr); },
+      onError(e) { log("\n" + e + "\n"); },
+      onClose(code) {
+        busy = false; setButtons(); $("busy").textContent = code === 0 ? "· done" : "· failed";
+        const rb = $("runbar"); rb.className = "runbar " + (code === 0 ? "done" : "fail");
+        $("runspin").hidden = true; $("runclose").hidden = false;
+        $("runtitle").textContent = describe(args) + (code === 0 ? ": done" : ": failed");
+        if (code === 0) setTimeout(() => { if (!busy) rb.hidden = true; }, 8000);
+        log("\n[finished, exit " + code + "]\n");
+        if (code === 0) dd.desktopUI.toast.success("Done"); else dd.desktopUI.toast.error("Failed, see the log");
+        refresh(); if (done) done(code);
+      }
+    }
+  });
+}
+
+function setButtons() {
+  const sel = document.querySelectorAll(".psel:checked").length;
+  const runSel = document.querySelectorAll(".psel:checked[data-running='1']").length;
+  for (const [id, word] of [["arbtn", "Archive"], ["bkbtn", "Back up"]]) {
+    $(id).disabled = busy || !sel || !(status && status.dest_mounted) || (id === "arbtn" && runSel > 0);
+    $(id).textContent = sel ? `${word} (${sel})` : word;
+  }
+  $("arbtn").title = runSel ? "Running projects can't be archived. Stop them first, or use Back up." : "";
+  document.querySelectorAll("button.act").forEach(b => { if (!b.dataset.locked && !b.classList.contains("go")) b.disabled = busy; });
+}
+
+async function refresh() {
+  $("dest").value = dest;
+  try { status = await json("status"); } catch (e) { log("status failed: " + e.message + "\n"); return; }
+  $("drive").outerHTML = status.dest_mounted ? '<span id="drive" class="badge b-ok"><svg><use href="#i-dot"/></svg>Drive connected</span>'
+                                              : '<span id="drive" class="badge b-bad"><svg><use href="#i-dot"/></svg>Drive not connected</span>';
+  const b = status.battery;
+  $("batt").className = "badge " + (b.on_ac ? "b-ok" : (b.percent < 30 ? "b-warn" : "b-mut"));
+  $("batt").textContent = b.percent == null ? "Mains power" : `Battery ${b.percent}%${b.on_ac ? " · plugged in" : ""}`;
+  renderProjects();
+  try { renderArchives(await json("archives")); } catch (e) { $("atable").tBodies[0].innerHTML = ""; }
+  try { renderHistory(await json("history")); } catch (e) {}
+  try { renderSettings(await json("settings")); } catch (e) {}
+  try {
+    const t = (await call(["schedule"])).trim(), h = /hour (\d+)/.exec(t);
+    schedOn = !t.startsWith("installed: no"); schedHour = h ? +h[1] : null;
+    $("schedbadge").className = "badge " + (schedOn ? "b-ok" : "b-mut");
+    $("schedbadge").innerHTML = schedOn ? '<svg><use href="#i-dot"/></svg>On' + (h ? " · daily " + String(h[1]).padStart(2, "0") + ":00" : "") : "Off";
+    if (schedOn && h && $("savebtn").disabled) $("ahour").value = h[1];
+    $("schedhint").textContent = schedOn ? "On because automatic backups or archiving is on. It turns off when both are off."
+                                         : "Switches on by itself when you turn on automatic backups or archiving and save.";
+  } catch (e) {}
+  setButtons();
+}
+
+function renderProjects() {
+  const tb = $("ptable").tBodies[0]; tb.innerHTML = "";
+  let total = 0, idle = 0;
+  for (const p of status.projects) {
+    total += p.frees_if_removed; if ((p.idle_days || 0) >= 56) idle++;
+    const tr = tb.insertRow();
+    const st = p.running ? badge("b-ok", p.running + " running", 1)
+             : (p.idle_days || 0) >= 56 ? badge("b-warn", "idle", 1) : badge("b-mut", "stopped", 1);
+    tr.innerHTML = `<td><input type="checkbox" class="psel" value="${esc(p.project)}" aria-label="Select ${esc(p.project)}" data-running="${p.running ? 1 : ""}"></td>
+      <td><button class="expander" aria-expanded="${!!open[p.project]}"><svg><use href="#i-chev"/></svg>${esc(p.project)}</button>
+          <div class="mut small">${p.containers.length} container${p.containers.length === 1 ? "" : "s"}</div></td>
+      <td>${st}</td>
+      <td class="num">${p.idle_days == null ? "?" : p.idle_days + " days"}</td>
+      <td class="num"><strong>${human(p.frees_if_removed)}</strong></td>
+      <td>${p.backups.length ? badge("b-ok", p.backups.length + " · latest " + p.backups[p.backups.length - 1].slice(0, 8)) : badge("b-mut", "none")}</td>`;
+    tr.querySelector(".expander").onclick = () => { open[p.project] = !open[p.project]; renderProjects(); setButtons(); };
+    tr.querySelector("input").onchange = setButtons;
+    if (open[p.project]) {
+      for (const c of p.containers) {
+        const s = tb.insertRow(); s.className = "sub";
+        const vols = c.volumes.map(v => `${esc(v.name)} ${human(v.size)}${v.shared ? " (shared)" : ""}`).join("<br>") || "–";
+        s.innerHTML = `<td></td><td>${esc(c.name)}<div class="mut">${esc(c.image)}</div></td>
+          <td>${esc(c.state)}</td><td class="num"><span class="mut">image</span> ${human(c.image_size)}</td>
+          <td class="num"><span class="mut">changes inside</span> ${human(c.changes_size)}</td><td>${vols}</td>`;
+      }
+    }
+  }
+  if (!status.projects.length) tb.innerHTML = '<tr><td colspan="6" class="empty">No containers in Docker.</td></tr>';
+  $("k-proj").textContent = status.projects.length; $("k-idle").textContent = idle; $("k-free").textContent = human(total);
+}
+
+function when(name) {
+  const m = /^(\d{4})(\d\d)(\d\d)-(\d\d)(\d\d)/.exec(name || "");
+  if (!m) return esc(name);
+  const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]));   // folder stamps are UTC
+  return esc(d.toLocaleString(undefined, { day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" }));
+}
+function renderArchives(list) {
+  const tb = $("atable").tBodies[0]; tb.innerHTML = "";
+  $("k-bk").textContent = list.filter(a => !a.partial).length;
+  if (!list.length) { tb.innerHTML = '<tr><td colspan="5" class="empty">Nothing saved yet. Tick projects on the Projects tab and press "Archive" or "Back up".</td></tr>'; return; }
+  for (const a of list.slice().reverse()) {
+    const tr = tb.insertRow();
+    const removed = a.flags.includes("REMOVED") && !a.flags.includes("RESTORED");
+    const restored = a.flags.includes("RESTORED");
+    const inDocker = status && status.projects.some(p => p.project.replace(/[^A-Za-z0-9_.-]/g, "_") === a.project);
+    const state = a.partial ? badge("b-bad", "Unfinished", 1) :
+      removed ? badge("b-warn", "Archived · not in Docker", 1) :
+      !inDocker ? badge("b-warn", "Backup · project not in Docker", 1) :
+      restored ? badge("b-mut", "Outdated · restored from") : badge("b-ok", "Backup · in Docker", 1);
+    tr.innerHTML = `<td>${esc(a.project)}</td><td class="when" title="${esc(a.archive)}">${when(a.archive)}</td><td class="num">${human(a.size)}</td><td>${state}</td><td><div class="acts"></div></td>`;
+    if (a.partial) continue;
+    const acts = tr.querySelector(".acts");
+    const mk = (label, cls, why, fill) => {
+      const b = document.createElement("button");
+      b.className = "act " + cls; b.textContent = label;
+      if (why) { b.disabled = true; b.dataset.locked = "1"; b.title = why; }
+      b.onclick = () => openDrawer(tr, label, fill);
+      acts.appendChild(b);
+    };
+    mk("Restore", inDocker ? "ghost" : "",
+       inDocker ? "The project is still in Docker. Restore is for projects that aren't." : "",
+       d => {
+         d.innerHTML = `<div class="row-act"><strong>Restore ${esc(a.project)}</strong>
+           <span class="opts"><label><input type="checkbox" class="st" checked> Start it</label>
+           <label><input type="checkbox" class="kb"> Keep this archive afterwards</label>
+           <label><input type="checkbox" class="kr"> Keep auto-start</label></span>
+           <button class="act go">Restore</button><button class="ghost no">Cancel</button></div>
+           <p class="mut small" style="margin:6px 0 0">With "Start it", the archive is deleted only after every volume matches and all containers stay healthy.</p>`;
+         d.querySelector(".go").onclick = () => {
+           const args = ["restore", a.path, "--yes"];
+           if (d.querySelector(".st").checked) args.push("--start");
+           if (d.querySelector(".kb").checked) args.push("--keep-backup");
+           if (d.querySelector(".kr").checked) args.push("--keep-restart-policy");
+           stream(args);
+         };
+       });
+    mk("Remove from Docker", "ghost",
+       !inDocker ? "The project isn't in Docker." : restored ? "This copy is older than the project in Docker. Back it up again first." : "",
+       d => {
+         d.innerHTML = `<div class="row-act"><span class="small" style="color:var(--bad)"><strong>Remove ${esc(a.project)} from Docker.</strong>
+           Its containers, volumes and images are deleted. This backup becomes the only copy (status: Archived).</span>
+           <input type="text" class="cf" aria-label="Type ${esc(a.project)} to confirm" placeholder="type ${esc(a.project)}" size="22">
+           <button class="act danger go" disabled>Remove from Docker</button><button class="ghost no">Cancel</button></div>`;
+         const inp = d.querySelector(".cf"), go = d.querySelector(".go");
+         inp.oninput = () => { go.disabled = busy || inp.value !== a.project; };
+         go.onclick = () => stream(["remove", a.path, "--yes"]);
+         inp.focus();
+       });
+    mk(removed ? "Delete archive" : "Delete backup", "ghost", "", d => {
+      if (inDocker) {
+        d.innerHTML = `<div class="row-act"><span class="small">${esc(a.project)} is still in Docker, so this is not its only copy. Delete this ${removed ? "archive" : "backup"} from the drive?</span>
+          <button class="act danger go">Delete</button><button class="ghost no">Cancel</button></div>`;
+        d.querySelector(".go").onclick = () => stream(["delete-backup", a.path, "--yes"]);
+      } else {
+        d.innerHTML = `<div class="row-act"><span class="small" style="color:var(--bad)"><strong>Warning:</strong> ${esc(a.project)} is not in Docker.
+          This may be the only copy of its data. It cannot be recovered.</span>
+          <input type="text" class="cf" aria-label="Type delete to confirm" placeholder="type delete" size="12">
+          <button class="act danger go" disabled>Delete forever</button><button class="ghost no">Cancel</button></div>`;
+        const inp = d.querySelector(".cf"), go = d.querySelector(".go");
+        inp.oninput = () => { go.disabled = busy || inp.value.trim().toLowerCase() !== "delete"; };
+        d.querySelector(".go").onclick = () => stream(["delete-backup", a.path, "--only-copy", "--yes"]);
+        inp.focus();
+      }
+    });
+  }
+}
+function openDrawer(tr, key, fill) {
+  const next = tr.nextElementSibling, same = next && next.classList.contains("drawer") && next.dataset.key === key;
+  document.querySelectorAll("#atable tr.drawer").forEach(x => x.remove());
+  document.querySelectorAll("#atable tr.open").forEach(x => x.classList.remove("open"));
+  if (same) return;
+  const d = document.createElement("tr"); d.className = "drawer"; d.dataset.key = key;
+  d.innerHTML = '<td colspan="5"></td>'; tr.after(d); tr.classList.add("open");
+  fill(d.cells[0]);
+  d.querySelectorAll(".no").forEach(b => b.onclick = () => { d.remove(); tr.classList.remove("open"); });
+}
+
+const HACT = { backup: "Back up", archive: "Archive", remove: "Remove from Docker", restore: "Restore", "delete-backup": "Delete",
+               verify: "Verify", auto: "Daily check", settings: "Settings changed", schedule: "Daily check setup" };
+function renderHistory(list) {
+  const tb = $("htable").tBodies[0]; tb.innerHTML = "";
+  for (const h of list.slice(-300).reverse()) {
+    const tr = tb.insertRow();
+    const r = String(h.result);
+    const cls = r.startsWith("ok") ? "b-ok" : r.startsWith("skipped") || r === "removed" ? "b-mut" : r.startsWith("interrupted") ? "b-warn" : "b-bad";
+    const det = [];
+    if (h.archive) det.push(h.archive);
+    if (h.size) det.push(human(h.size));
+    if (h.freed) det.push("freed " + human(h.freed));
+    if (h.auto) det.push("automatic");
+    if (h.paused_running) det.push("paused while copying");
+    if (h.reason === "user") det.push("by you"); else if (h.reason) det.push(h.reason.replace("max_backups=", "over keep limit "));
+    if (h.only_copy) det.push("was the only copy");
+    if (h.deleted_backup) det.push("archive deleted after healthy start");
+    if (h.kept_backup) det.push("archive kept");
+    if (h.changes) det.push(h.changes);
+    if (h.hour != null) det.push("daily at " + h.hour + ":00");
+    tr.innerHTML = `<td class="mut when">${esc(new Date(h.time).toLocaleString(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }))}</td><td>${esc(HACT[h.action] || h.action)}</td>
+      <td>${esc(h.project)}</td><td>${badge(cls, r.length > 60 ? r.slice(0, 60) + "…" : r)}</td><td class="mut small" title="${esc(r)}">${esc(det.join(" · "))}</td>`;
+  }
+  if (!list.length) tb.innerHTML = '<tr><td colspan="5" class="empty">No history yet.</td></tr>';
+}
+
+function renderSettings(st) {
+  const auto = Object.assign({enabled:false, weeks:8, min_battery:50}, st.auto || {});
+  const bk = Object.assign({enabled:false, every_days:7, running:"skip"}, st.backups || {});
+  $("maxb").value = st.default_max_backups || 3;
+  $("aen").checked = !!auto.enabled; $("aweeks").value = auto.weeks; $("abatt").value = auto.min_battery;
+  $("ben").checked = !!bk.enabled; $("bdays").value = bk.every_days;
+  document.querySelectorAll("input[name=brun]").forEach(r => r.checked = r.value === bk.running);
+  settingsChanged(false);
+}
+function settingsChanged(dirty) {
+  $("c-bk").classList.toggle("off", !$("ben").checked);
+  $("c-ar").classList.toggle("off", !$("aen").checked);
+  const pause = (document.querySelector("input[name=brun]:checked") || {}).value === "pause";
+  $("bhint").textContent = (pause ? "Running projects are paused for the copy (about a minute per GB), then resumed. "
+                                  : "Running projects are skipped until they're stopped. ")
+    + "Unchanged stopped projects are skipped. The keep limit also applies to backups you make by hand.";
+  $("savebtn").disabled = !dirty; $("dirty").textContent = dirty ? "Unsaved changes" : "";
+}
+$("ahour").addEventListener("change", () => settingsChanged(true));
+document.querySelectorAll("#p-auto input").forEach(i => i.addEventListener(i.type === "number" ? "input" : "change", () => settingsChanged(true)));
+$("abatt").addEventListener("input", () => settingsChanged(true));
+
+let CF_ARCHIVE = null, schedOn = false, schedHour = null;
+function saveSelected(mode) {
+  if (CF_ARCHIVE === null) CF_ARCHIVE = $("cfbody").innerHTML;
+  const names = [...document.querySelectorAll(".psel:checked")].map(x => x.value);
+  if (!names.length) return;
+  const running = [...document.querySelectorAll(".psel:checked[data-running='1']")].map(x => x.value);
+  if (mode === "backup" && !running.length) { $("confirmbox").hidden = true; stream(["backup"].concat(names, ["--yes"])); return; }
+  if (mode === "backup") {
+    $("cftitle").textContent = "Back up " + names.join(", ");
+    $("cfbody").innerHTML = `<strong>${esc(running.join(", "))} ${running.length === 1 ? "is" : "are"} running.</strong> Running containers are paused
+      while they are copied (about a minute per GB), then resumed. Nothing is removed from Docker.`;
+    $("cfgo").textContent = "Pause and back up";
+    $("cfgo").onclick = () => { $("confirmbox").hidden = true; stream(["backup"].concat(names, ["--pause-running", "--yes"])); };
+    $("confirmbox").hidden = false; $("cfgo").focus(); return;
+  }
+  $("cfbody").innerHTML = CF_ARCHIVE; $("cfgo").textContent = "Archive and remove from Docker";
+  $("cftitle").textContent = "Archive " + names.length + " project" + (names.length === 1 ? "" : "s") + ": " + names.join(", ");
+  $("cfgo").onclick = () => { $("confirmbox").hidden = true; stream(["backup"].concat(names, ["--remove-after", "--yes"])); };
+  $("confirmbox").hidden = false;
+  $("cfgo").focus();
+}
+async function saveAll() {
+  const run = (document.querySelector("input[name=brun]:checked") || {}).value || "skip";
+  try {
+    await call(["settings", $("aen").checked ? "--archive-enable" : "--archive-disable", "--archive-weeks", String($("aweeks").value),
+                $("ben").checked ? "--backup-enable" : "--backup-disable", "--backup-days", String($("bdays").value),
+                "--backup-running", run, "--max-backups", String($("maxb").value), "--min-battery", String($("abatt").value)]);
+    const want = $("ben").checked || $("aen").checked, hour = +$("ahour").value;
+    if (want && (!schedOn || schedHour !== hour)) await call(["schedule", "--hour", String(hour)]);
+    if (!want && schedOn) await call(["schedule", "--remove"]);
+    dd.desktopUI.toast.success(want ? "Saved · daily check on at " + String(hour).padStart(2, "0") + ":00" : "Saved · daily check off");
+    settingsChanged(false); refresh();
+  } catch (e) { dd.desktopUI.toast.error(e.message); }
+}
+function runAuto() { stream(["auto"]); }
+function schedule(on) { stream(on ? ["schedule", "--hour", String($("ahour").value)] : ["schedule", "--remove"]); }
+async function pickDest() {
+  const r = await dd.desktopUI.dialog.showOpenDialog({ properties: ["openDirectory", "createDirectory"] });
+  if (!r.canceled && r.filePaths.length) { $("dest").value = r.filePaths[0]; saveDest(); }
+}
+function saveDest() { dest = $("dest").value.trim() || DEFAULT_DEST; try { localStorage.setItem("dest", dest); } catch (e) {} refresh(); }
+
+refresh();
+</script>
+</body>
+</html>
