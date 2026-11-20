@@ -2720,6 +2720,20 @@ def same_compose(c, wd):
         return False
 
 
+def compose_services(wd):
+    """Service names in the compose project in folder wd, or an empty set if compose can't read it."""
+    try:
+        out = subprocess.run(["docker", "compose", "config", "--services"], cwd=wd, capture_output=True,
+                             text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    return set(out.stdout.split()) if out.returncode == 0 else set()
+
+
+def archived_services(m):
+    return {(c["inspect"]["Config"].get("Labels") or {}).get("com.docker.compose.service") for c in m["containers"]} - {None}
+
+
 def missing_binds(m, moves=(), refill=False):
     """Bind sources that would be missing after a restore with these folder moves (and --restore-files)."""
     return sorted({moved(b["source"], moves) for c in m["containers"] for b in c["bind_mounts"]
@@ -2814,8 +2828,12 @@ def cmd_ensure(a):
             elsewhere(n)
             if wd:
                 like = sorted({(c["project"], c["wd"]) for c in copies if c["archived"] and same_compose(c, wd)})
+                if not like:   # renamed and compose edited since: match on the same set of service names
+                    svcs = compose_services(wd)
+                    like = sorted({(c["project"], c["wd"]) for c in copies if c["archived"] and svcs and c["wd"]
+                                   and not os.path.isdir(c["wd"]) and archived_services(c["m"]) == svcs})
                 if like:
-                    ensure_exit(ENSURE_ASK, "no copy of %s was saved, but %s has the same compose file as archived "
+                    ensure_exit(ENSURE_ASK, "no copy of %s was saved, but %s looks like archived "
                                 "project(s) saved from a folder that is gone: %s. If the project moved here, ask the user, "
                                 "then run: ensure %s --project-folder \"%s\"" % (n, wd, ", ".join(
                                     "%s (%s)" % x for x in like), like[0][0], wd))
