@@ -1342,6 +1342,7 @@ def rollback(created):
 def cmd_restore(a):
     restore_lock(wait=False)
     del EXTRA_PROBLEM[:]
+    del NO_RECREATE[:]
     d = os.path.abspath(a.archive)
     good, msg = verify_dir(d, extras_strict=False)
     if not good:
@@ -1365,7 +1366,12 @@ def cmd_restore(a):
         print("  folder %s -> %s" % (o, n))
     putback = getattr(a, "restore_files", False)
     wd_now = host_path((m.get("compose") or {}).get("working_dir") or "")
-    if putback and wd_now and not os.path.isdir(wd_now):
+    refill = [b for c in m["containers"] for b in c["bind_mounts"] if b.get("copy") and bind_problem(b)]
+    for c in m["containers"]:
+        for b in c["bind_mounts"]:
+            if bind_problem(b) and not (putback and b.get("copy")):
+                b["_was_missing"] = True   # stays a problem even if put-back creates its folder
+    if putback and refill and wd_now and not os.path.isdir(wd_now):
         die("the project folder %s is gone, so files can't be put back into it. If the project moved, choose its new "
             "folder with --project-folder." % wd_now)
     for c in m["containers"]:
@@ -2105,8 +2111,10 @@ def measure_bind(src):
     import stat
     try:
         st = os.stat(src)
-    except OSError:
+    except FileNotFoundError:
         return None, "missing"
+    except OSError as e:
+        return None, "could not read it (%s)" % (e.strerror or e)
     if stat.S_ISREG(st.st_mode):
         return ("file", st.st_size) if st.st_size <= BIND_FILE_MAX else (None, "too big (%s)" % human(st.st_size))
     if not stat.S_ISDIR(st.st_mode):
@@ -2240,6 +2248,9 @@ def compose_hashes(project, wd, files, env_file=None, cwd=None):
     return {k: v.strip() for k, v in h.items()} or None
 
 
+NO_RECREATE = []   # services compose may re-create after a folder move (set by fix_compose_hash)
+
+
 def fix_compose_hash(m, d, moves, old_wd):
     """After a folder move, compose would see a new config hash and re-create the containers (losing changes made
     inside them). If the compose files in the new folder are the ones that were archived, store the new hash."""
@@ -2262,13 +2273,21 @@ def fix_compose_hash(m, d, moves, old_wd):
         if comp.get("config_files"):
             print("  note: the compose files in %s differ from the archived ones; compose will re-create the containers" % wd)
         return
+    kept = []
     for c in m["containers"]:
         labels = c["inspect"]["Config"].get("Labels") or {}
         svc = labels.get("com.docker.compose.service")
+        if svc in now and labels.get("com.docker.compose.config-hash") and \
+                labels["com.docker.compose.config-hash"] != orig.get(svc):
+            kept.append(svc)
         # only when the container matched the archived compose file (no edit was waiting for a compose up)
         if svc in now and labels.get("com.docker.compose.config-hash") and \
                 labels["com.docker.compose.config-hash"] == orig.get(svc):
             labels["com.docker.compose.config-hash"] = now[svc]
+    NO_RECREATE[:] = sorted(set(kept))
+    if kept:
+        print("  note: compose may re-create %s after the move (its settings can't be matched, e.g. env_file). To keep "
+              "the restored container, start with: docker compose up -d --no-recreate" % ", ".join(sorted(set(kept))))
 
 
 def bind_absent(b, path=None):
@@ -2277,18 +2296,29 @@ def bind_absent(b, path=None):
     p = path or b["source"]
     if not os.path.lexists(p):
         return True
-    if os.path.islink(p) or not os.path.isdir(p) or os.listdir(p):
+    try:
+        if os.path.islink(p) or not os.path.isdir(p) or [x for x in os.listdir(p) if x != ".DS_Store"]:
+            return False
+    except OSError:
         return False
     return b.get("kind") == "file" or (b.get("kind") == "dir" and b.get("copy_size", 0) > 0)
 
 
+MAC_SHARED = ("/Users/", "/Volumes/", "/private/", "/tmp/", "/var/folders/", "/host_mnt/")   # Docker Desktop file sharing
+
+
 def bind_needed(b):
-    """False for a bind source that was already missing on the Mac at backup time (e.g. Docker VM-only paths)."""
-    return b.get("not_copied") != "missing"
+    """False for a bind source that was already missing on the Mac at backup time (e.g. Docker VM-only paths).
+    Archives from before bind copies don't record that: there, only paths in Docker Desktop's shared folders count."""
+    if "copy" in b or "not_copied" in b:
+        return b.get("not_copied") != "missing"
+    return b["source"].startswith(MAC_SHARED)
 
 
 def bind_problem(b, path=None):
-    return bind_needed(b) and bind_absent(b, path)
+    """A needed bind source that is missing, or was missing before files were put back (put-back can create a
+    parent folder that makes a missing, uncopied bind look present)."""
+    return bind_needed(b) and (b.get("_was_missing") or bind_absent(b, path))
 
 
 def put_back_files(m, d, done):
@@ -2316,8 +2346,10 @@ def put_back_files(m, d, done):
                 done.append(("dir", p))
                 os.mkdir(p)
         if os.path.isdir(src) and not os.path.islink(src):
-            os.rmdir(src)   # the empty folder Docker made in its place
             done.append(("emptydir", src))
+            if os.path.isfile(os.path.join(src, ".DS_Store")):
+                os.remove(os.path.join(src, ".DS_Store"))
+            os.rmdir(src)   # the empty folder Docker made in its place
         done.append(("copy", src))
         copy_bind(os.path.join(d, b["copy"]), src)
         print("  put back %s" % src)
@@ -2730,6 +2762,38 @@ def compose_services(wd):
     return set(out.stdout.split()) if out.returncode == 0 else set()
 
 
+def compose_images(wd):
+    try:
+        out = subprocess.run(["docker", "compose", "config", "--images"], cwd=wd, capture_output=True,
+                             text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return set()
+    return set(out.stdout.split()) if out.returncode == 0 else set()
+
+
+def archived_images(m):
+    return {c["inspect"]["Config"].get("Image") for c in m["containers"]} - {None}
+
+
+NOT_MOVED_FILE = os.path.expanduser("~/.docker-archive-not-moved.json")   # folders the user said are new projects
+
+
+def load_not_moved():
+    try:
+        with open(NOT_MOVED_FILE) as f:
+            return set(json.load(f))
+    except (OSError, ValueError, TypeError):
+        return set()
+
+
+def save_not_moved(wd):
+    try:
+        with open(NOT_MOVED_FILE, "w") as f:
+            json.dump(sorted(load_not_moved() | {wd}), f)
+    except OSError:
+        pass
+
+
 def archived_services(m):
     return {(c["inspect"]["Config"].get("Labels") or {}).get("com.docker.compose.service") for c in m["containers"]} - {None}
 
@@ -2772,10 +2836,19 @@ def cmd_ensure(a):
                             "inside it: %s. Run ensure from the project's own folder." % (here, ", ".join(below)))
         names |= {c["project"] for c in copies if c["wd"] == wd}
         names |= {p for p, ws in (arch or {}).items() if wd in ws}
+        here_in_docker = {p for p, ws in in_docker.items() if wd in ws}
+        own = compose_name(wd) if compose_dir_of(here) else None
+        if own and here_in_docker and own not in here_in_docker and drive and arch is not None \
+                and own not in arch and not any(c["project"] == own for c in copies) \
+                and not any(sub == safe_name(own) for sub, _ in bad) \
+                and not any(own in (e.get("archived") or {}) for e in load_index().values()):
+            names.discard(own)   # nothing of the folder's own name anywhere: only the projects Docker has from it
+        names |= here_in_docker
         if not names:
             ensure_exit(ENSURE_READY, "no compose project in %s. Nothing to restore." % here)
     else:
         wd = None
+        here_in_docker = set()
         known = target in in_docker or target in (arch or {}) or any(c["project"] == target for c in copies)
         names = {target if known else norm_project(target)} - {""}
     others_idx = {d: e.get("archived", {}) for d, e in load_index().items() if d != os.path.abspath(a.dest)}
@@ -2788,7 +2861,7 @@ def cmd_ensure(a):
                             "user; the skill may need updating from the Claude Code tab in Docker Desktop." % (n, d, a.dest))
 
     vols_now = set(run(["docker", "volume", "ls", "-q"]).split())
-    notes, todo = [], []
+    notes, todo, restored_now, start_cmd = [], [], [], False
     for n in sorted(names):
         if n in in_docker:
             if wd is None or wd in in_docker[n] or "" in in_docker[n]:
@@ -2817,6 +2890,8 @@ def cmd_ensure(a):
             continue
         pf = getattr(a, "project_folder", None)
         mine = [c for c in copies if c["project"] == n and (wd is None or pf or c["wd"] == wd)]
+        if pf:   # moved project: the copies from the folder that is gone, if there are any
+            mine = [c for c in mine if c["archived"] and c["wd"] and not os.path.isdir(c["wd"])] or mine
         if not mine:
             others = sorted({c["wd"] or "?" for c in copies if c["project"] == n})
             if others:
@@ -2826,23 +2901,34 @@ def cmd_ensure(a):
             if any(sub == safe_name(n) for sub, _ in bad):
                 ensure_exit(ENSURE_ASK, "the drive has copies of %s that can't be read or are from an old version." % n)
             elsewhere(n)
-            if wd:
-                like = sorted({(c["project"], c["wd"]) for c in copies if c["archived"] and same_compose(c, wd)})
-                if not like:   # renamed and compose edited since: match on the same set of service names
+            gone = [c for c in copies if c["archived"] and c["wd"] and not os.path.isdir(c["wd"])]
+            if wd and gone and not here_in_docker and not a.new_project and wd not in load_not_moved():
+                like = sorted({(c["project"], c["wd"]) for c in gone if same_compose(c, wd)})
+                if not like:   # renamed and compose edited since: same services (2+, or same images)
                     svcs = compose_services(wd)
-                    like = sorted({(c["project"], c["wd"]) for c in copies if c["archived"] and svcs and c["wd"]
-                                   and not os.path.isdir(c["wd"]) and archived_services(c["m"]) == svcs})
+                    imgs = compose_images(wd) if len(svcs) == 1 else set()
+                    def built(imgs_, proj):   # <project>-<service> images from build: compare without the name
+                        return {"<built>" if any(i.split(":")[0] in ("%s-%s" % (proj, x), "%s_%s" % (proj, x))
+                                                 for x in svcs) else i for i in imgs_}
+                    like = sorted({(c["project"], c["wd"]) for c in gone if svcs and archived_services(c["m"]) == svcs
+                                   and (len(svcs) > 1 or built(archived_images(c["m"]), c["project"])
+                                        == built(imgs, compose_name(wd)))})
                 if like:
-                    ensure_exit(ENSURE_ASK, "no copy of %s was saved, but %s looks like archived "
-                                "project(s) saved from a folder that is gone: %s. If the project moved here, ask the user, "
-                                "then run: ensure %s --project-folder \"%s\"" % (n, wd, ", ".join(
-                                    "%s (%s)" % x for x in like), like[0][0], wd))
+                    ensure_exit(ENSURE_ASK, "no copy of %s was saved, but %s looks like archived project(s) saved from "
+                                "a folder that is gone: %s. Ask the user. If the project moved here, run: ensure %s "
+                                "--project-folder \"%s\". If it is a different project, run ensure again with "
+                                "--new-project (remembered for this folder)." % (
+                                    n, wd, ", ".join("%s (%s)" % x for x in like), like[0][0], wd))
+            if wd and a.new_project:
+                save_not_moved(wd)
             notes.append("%s has no saved copy" % n)
             continue
         if (wd is None or pf) and len({c["wd"] for c in mine}) > 1:
             ensure_exit(ENSURE_ASK, "copies of %s were saved from several folders (%s). %s" % (
                 n, ", ".join(sorted({c["wd"] or "?" for c in mine})),
-                "Ask the user which one this is." if pf else "Run ensure from the project's folder instead."))
+                ("Ask the user which one this is. They can restore it from the Archive tab in Docker Desktop, choosing "
+                 "the project folder there, or with: docker-archive.py restore <archive folder> --project-folder "
+                 "\"%s\"" % pf) if pf else "Run ensure from the project's folder instead."))
         archived = [c for c in mine if c["archived"]]
         pick = max(archived or mine, key=lambda c: c["stamp"])
         vols = [v["name"] for v in pick["m"]["volumes"]]
@@ -2904,9 +2990,23 @@ def cmd_ensure(a):
         if outcome in ("problems", "unhealthy"):
             ensure_exit(ENSURE_ASK, "restored %s, but not every container started and stayed up (see above)." % n)
         notes.append("restored %s%s" % (n, " and started it" if a.start else ""))
-        if pf and compose_dir_of(pf) and compose_name(compose_dir_of(pf)) != n:
-            notes.append("the folder's name differs from the project's, so start it with: docker compose -p %s up -d" % n)
-    ensure_exit(ENSURE_READY, "%s. Start the project as usual." % "; ".join(notes))
+        restored_now.append(n)
+        if NO_RECREATE:
+            notes.append("compose may re-create %s; to keep the restored containers start with: docker compose -p %s "
+                         "up -d --no-recreate" % (", ".join(NO_RECREATE), n))
+            start_cmd = True
+    # the folder's compose name is not what Docker has (renamed folder): plain compose up would make a new, empty project
+    pf = getattr(a, "project_folder", None)
+    home = compose_dir_of(os.path.realpath(pf) if pf else wd) if (pf or wd) else None
+    if home:
+        own = compose_name(home)
+        ready = sorted((set(restored_now) | {p for p, ws in in_docker.items() if home in ws}) - {own})
+        if ready and own not in in_docker and own not in restored_now:
+            notes.append("the folder's name differs from the project's, so start it with: %s (plain docker compose up "
+                         "would create a new, empty project)" % " or ".join("docker compose -p %s up -d" % p for p in ready))
+            start_cmd = True
+    ensure_exit(ENSURE_READY, "%s. %s" % ("; ".join(notes), "Use the start command above." if start_cmd
+                                          else "Start the project as usual."))
 
 
 # ---------------------------------------------------------------- Claude Code skill
@@ -2942,7 +3042,7 @@ Read the last line (it starts with `ENSURE:`) and the exit code:
 
 | Exit | Meaning | What to do |
 |---|---|---|
-| 0 | Ready: in Docker, restored, or nothing archived | Start the project the usual way, e.g. `docker compose up -d` |
+| 0 | Ready: in Docker, restored, or nothing archived | Start the project the usual way, e.g. `docker compose up -d`, unless the `ENSURE:` line gives a start command: then use that |
 | 3 | The archive drive is not connected | Ask the user to connect it, then run ensure again. Don't start the project before that |
 | 4 | Needs a decision, or the restore failed | Stop. Show the user the `ENSURE:` line and do what they decide |
 | any other | Error (bad arguments, Docker not running, interrupted) | Stop and show the user the error |
@@ -2952,9 +3052,11 @@ Add `--start` to let ensure start the restored containers and check they stay up
 ## Rules
 
 - Only restore. Never back up, archive, remove projects from Docker, or delete saved copies. Those change or delete data; the user does them in the Archive tab in Docker Desktop.
-- Use `--restore-anyway`, `--project-folder` and `--restore-files` only after the user says so (exit 4 explains when).
+- Use `--restore-anyway`, `--project-folder`, `--restore-files` and `--new-project` only after the user says so (exit 4 explains when).
   - `--project-folder "<folder>"`: the project was moved; restore it pointing at its new folder.
   - `--restore-files`: put back config and secrets files the archive kept copies of. It never overwrites a file.
+  - `--new-project`: the user says this folder is a different project, not a moved archived one.
+- If the `ENSURE:` line gives a start command (such as `docker compose -p NAME up -d`), use that command.
 - Don't create missing bind-mount folders or delete volumes to get past exit 4. Ask the user.
 """
 
@@ -3148,6 +3250,8 @@ def main():
                     help="restore a copy even though the project was not archived by docker-archive, was restored "
                          "before, or misses bind-mounted files")
     en.add_argument("--project-folder", metavar="PATH", help="the project folder has moved here (see restore)")
+    en.add_argument("--new-project", action="store_true",
+                    help="this folder is not a moved archived project; stop asking (remembered for the folder)")
     en.add_argument("--restore-files", action="store_true",
                     help="put back missing bind-mounted files from the archive's copies")
     en.add_argument("--check-seconds", type=int, default=30, help=argparse.SUPPRESS)
